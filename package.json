@@ -1,0 +1,83 @@
+{
+  "name": "@imqueue/pg-prisma",
+  "version": "1.0.0",
+  "description": "Prisma/Postgres toolkit for Node.js & TypeScript microservices — query extensions (soft-delete, audit, authorship, access-scope), row archiving, change-notify triggers, down-migrations, and a Prisma generator for typed @imqueue/rpc models (the @imqueue framework)",
+  "keywords": [
+    "prisma",
+    "postgres",
+    "postgresql",
+    "prisma-extension",
+    "prisma-generator",
+    "soft-delete",
+    "audit",
+    "access-control",
+    "migrations",
+    "typescript",
+    "nodejs",
+    "microservices",
+    "rpc",
+    "soa",
+    "imqueue"
+  ],
+  "scripts": {
+    "clean-compiled": "npm run clean-js && npm run clean-typedefs && npm run clean-maps",
+    "build": "npm run clean-compiled && tsc",
+    "prepare": "npm run build",
+    "lint": "oxlint",
+    "format": "oxfmt \"index.ts\" \"src/**/*.ts\" \"test/**/*.ts\"",
+    "format:check": "oxfmt --check \"index.ts\" \"src/**/*.ts\" \"test/**/*.ts\"",
+    "test": "npm run build && node --test --test-timeout=15000 $(find test -name '*.spec.js')",
+    "test-coverage": "npm run build && node --enable-source-maps --test --experimental-test-coverage --test-timeout=15000 $(find test -name '*.spec.js')",
+    "test-lcov": "npm run build && mkdir -p coverage && node --enable-source-maps --test --experimental-test-coverage --test-reporter=lcov --test-reporter-destination=coverage/lcov.info --test-timeout=15000 $(find test -name '*.spec.js'); node scripts/strip-comment-coverage.mjs coverage/lcov.info",
+    "test-coverage-html": "npm run test-lcov; genhtml coverage/lcov.info --output-directory coverage/html --ignore-errors inconsistent,corrupt,format,mismatch && echo \"Coverage report: file://$(pwd)/coverage/html/index.html\"",
+    "test-dev": "npm run test && npm run clean-js && npm run clean-typedefs && npm run clean-maps",
+    "clean-typedefs": "find . -name '*.d.ts' -not -wholename '*node_modules*' -type f -delete",
+    "clean-maps": "find . -name '*.js.map' -not -wholename '*node_modules*' -type f -delete",
+    "clean-js": "find . -name '*.js' -not -wholename '*node_modules*' -type f -delete",
+    "clean-tests": "rm -rf .nyc_output coverage .agent-out",
+    "clean": "npm run clean-tests && npm run clean-typedefs && npm run clean-maps && npm run clean-js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git://github.com/imqueue/pg-prisma.git"
+  },
+  "bugs": {
+    "url": "https://github.com/imqueue/pg-prisma/issues"
+  },
+  "homepage": "https://imqueue.org/",
+  "funding": "https://imqueue.com/",
+  "author": "imqueue.com <support@imqueue.com> (https://imqueue.com)",
+  "license": "GPL-3.0-only",
+  "dependencies": {
+    "@prisma/generator-helper": "^7.8.0",
+    "pg": "^8.22.0"
+  },
+  "peerDependencies": {
+    "@prisma/client": ">=7"
+  },
+  "devDependencies": {
+    "@prisma/client": "^7.8.0",
+    "@types/node": "^24.9.1",
+    "@types/pg": "^8.20.0",
+    "oxfmt": "0.57.0",
+    "oxlint": "1.72.0",
+    "typescript": "^7.0.2"
+  },
+  "main": "index.js",
+  "types": "index.d.ts",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./codegen": {
+      "types": "./src/codegen.d.ts",
+      "default": "./src/codegen.js"
+    },
+    "./package.json": "./package.json"
+  }
+}
