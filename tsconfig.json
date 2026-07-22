@@ -1,0 +1,29 @@
+{
+  "compilerOptions": {
+    "target": "es2024",
+    "lib": ["es2024"],
+    "moduleDetection": "force",
+
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "resolveJsonModule": true,
+    "esModuleInterop": true,
+    "verbatimModuleSyntax": true,
+
+    "types": ["node"],
+
+    "isolatedModules": true,
+
+    "declaration": true,
+    "sourceMap": true,
+    "inlineSources": true,
+    "removeComments": false,
+    "newLine": "lf",
+
+    "skipLibCheck": true,
+
+    "strict": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true
+  }
+}
