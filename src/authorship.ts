@@ -24,17 +24,38 @@
 
 import { Prisma } from '@prisma/client/extension';
 
-/** Per-model authorship column names, plus the delete-trigger column. */
+/** Which columns on one model carry authorship, and which one triggers a delete stamp. */
 export interface AuthorshipColumns {
+    /** Column stamped once, when the row is created. */
     createdBy: string;
+    /** Column stamped on create and on every update. */
     updatedBy: string;
+    /** Column stamped when an update sets `deletedAt`. */
     deletedBy: string;
-    /** Soft-delete column whose being-set makes an update stamp `deletedBy`. */
+    /**
+     * Soft-delete column whose being set makes an update stamp `deletedBy`.
+     *
+     * @remarks
+     * Optional: a model without one simply never stamps `deletedBy`. The
+     * extension looks at the incoming `data` for this key rather than at the
+     * stored row, so it stamps whenever a write is setting the column to a
+     * non-null value — which is what a soft delete rerouted through
+     * {@link softDelete} looks like.
+     */
     deletedAt?: string;
 }
 
+/**
+ * Which models carry authorship, keyed by Prisma model name.
+ *
+ * @remarks
+ * A model absent from this map passes through untouched. The code generator emits
+ * this as `AUTHORSHIP_MODELS`, so it normally comes from your schema rather than
+ * being written by hand.
+ */
 export type AuthorshipModels = Record<string, AuthorshipColumns>;
 
+/** Everything {@link authorship} needs to build its extension. */
 export interface AuthorshipOptions {
     /** Per-model authorship column config (the models to stamp). */
     models: AuthorshipModels;
@@ -67,14 +88,35 @@ function stripAuthorship(
 }
 
 /**
- * Query extension stamping the acting principal onto authored models: `createdBy`
- * + `updatedBy` on create, `updatedBy` on update, and `deletedBy` whenever a
- * write sets the model's soft-delete column (so soft-deletes routed through this
- * client — see `softDelete` — record who deleted the row). Column names are
- * per-model (see the generated `AUTHORSHIP_MODELS`). The actor id is resolved
- * lazily via `getActorId`; when it is null (a system or unauthenticated write)
- * nothing is stamped. Non-authored models pass through untouched. Stamps
- * override caller-supplied values so authorship can't be spoofed.
+ * Build the query extension that stamps who created, updated or deleted a row.
+ *
+ * @remarks
+ * Five operations are covered. `create` and `createMany` stamp `createdBy` and
+ * `updatedBy` (each element of a `createMany` array individually). `update` and
+ * `updateMany` stamp `updatedBy`, plus `deletedBy` when the write is also setting
+ * the model's `deletedAt` column — which is what a soft delete rerouted by
+ * {@link softDelete} looks like from here. `upsert` stamps its `create` and
+ * `update` branches with the matching rule, resolving the actor once for both.
+ *
+ * Authorship cannot be spoofed: any caller-supplied value for the three
+ * authorship columns is stripped from `data` before the stamp is applied, so this
+ * extension is their sole writer. That holds even when there is no actor — with
+ * `getActorId` returning null, the caller's values are still removed and nothing
+ * is written in their place, so a system write leaves the columns untouched
+ * rather than taking whatever the caller passed.
+ *
+ * Models absent from `models` pass through completely untouched, authorship
+ * columns included.
+ *
+ * @param input - The per-model column config and the actor resolver.
+ * @returns A Prisma extension to pass to `client.$extends()`.
+ * @example
+ * ```typescript
+ * const client = new PrismaClient().$extends(authorship({
+ *     models: AUTHORSHIP_MODELS,
+ *     getActorId: () => context.get()?.userId ?? null,
+ * }));
+ * ```
  */
 export function authorship({ models, getActorId }: AuthorshipOptions) {
     const forCreate = (

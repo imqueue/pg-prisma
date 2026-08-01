@@ -1,0 +1,93 @@
+/*!
+ * @imqueue/pg-prisma — package barrel regression tests
+ *
+ * I'm Queue Software Project
+ * Copyright (C) 2025  imqueue.com <support@imqueue.com>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * If you want to use this code in a closed source (commercial) project, you can
+ * purchase a proprietary commercial license. Please contact us at
+ * <support@imqueue.com> to get commercial licensing options.
+ */
+import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { createRequire } from 'node:module';
+import { join } from 'node:path';
+import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
+
+const HERE = fileURLToPath(new URL('.', import.meta.url));
+const ROOT = join(HERE, '..', '..');
+
+// The package is ESM, but Node >= 22 lets CommonJS `require()` an ESM module —
+// UNLESS some module in the graph is async (top-level await), which fails hard
+// with ERR_REQUIRE_ASYNC_MODULE. Two things put an async module in this graph and
+// so broke every CJS consumer of the package:
+//
+//   * `export * from './codegen.js'` in src/index.ts, which exported nothing at
+//     all (every `export` in codegen.ts is inside a generated-code template
+//     string) while pulling in its top-level `await import(...)`;
+//   * `await cli()` at the foot of src/migrate-down.ts.
+//
+// Neither is visible from inside ESM, which is why it went unnoticed. Run in a
+// child process because `require` of an async graph poisons nothing but is
+// simplest to assert on its own.
+test('the package barrel is require()-able from CommonJS', () => {
+    const out = execFileSync(
+        process.execPath,
+        [
+            '-e',
+            'const m = require(process.argv[1]);' +
+                'console.log(Object.keys(m).length)',
+            join(ROOT, 'index.js'),
+        ],
+        { encoding: 'utf8', cwd: ROOT },
+    );
+
+    assert.equal(Number(out.trim()), 16, 'expected 16 runtime exports');
+});
+
+test('the barrel exports the same names to ESM and CommonJS', async () => {
+    const esm = Object.keys(await import('../../index.js')).sort();
+    const cjs = Object.keys(
+        createRequire(import.meta.url)('../../index.js'),
+    ).sort();
+
+    assert.deepEqual(cjs, esm);
+});
+
+// migrate-down.ts doubles as a CLI. Rejections used to surface through a
+// top-level await; they now go through an explicit .catch(), so pin the contract
+// that replaced it — a message on stderr and a non-zero exit.
+test('the migrate-down CLI still fails with exit code 1', () => {
+    let status: number | null = null;
+    let stderr = '';
+
+    try {
+        execFileSync(
+            process.execPath,
+            [join(ROOT, 'src', 'migrate-down.js'), '--nope'],
+            { encoding: 'utf8', stdio: 'pipe' },
+        );
+    } catch (error) {
+        const failure = error as { status?: number; stderr?: string };
+
+        status = failure.status ?? null;
+        stderr = failure.stderr ?? '';
+    }
+
+    assert.equal(status, 1);
+    assert.match(stderr, /Unknown argument: --nope/);
+});

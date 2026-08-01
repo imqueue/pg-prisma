@@ -22,23 +22,47 @@
  * <support@imqueue.com> to get commercial licensing options.
  */
 
-/**
- * Cooperative SQL-log suppression. Self-contained (no external dependencies):
- * a query-log sink checks {@link isSqlLogSuppressed} before emitting, and any
- * code that must run quietly wraps itself in {@link silently}.
- *
- * It flips a shared module flag, so it is meant for pre-request one-offs (e.g.
- * startup DDL) rather than interleaved concurrent traffic. The flag lives on a
- * const wrapper so there is no reassignable binding.
- */
+// The flag lives on a const wrapper rather than a `let` so there is no
+// reassignable binding to import.
 const state = { suppressed: false };
 
-/** Whether SQL logging is currently suppressed — a log sink should skip while true. */
+/**
+ * Whether SQL logging is currently suppressed.
+ *
+ * @remarks
+ * This is the read half of a cooperative protocol, and cooperative is the
+ * operative word: nothing here intercepts logging. A query-log sink has to call
+ * this and skip emitting while it answers `true`, and code that wants to run
+ * quietly has to wrap itself in {@link silently}. A sink that does not check is
+ * unaffected by either.
+ *
+ * Suppression is a single module-wide flag, not per-client or per-request, so it
+ * suits one-off work that owns the process for its duration — startup DDL, a
+ * migration, a maintenance script. Under concurrent traffic it will also silence
+ * whatever else happens to be querying at the time.
+ *
+ * @returns `true` while a {@link silently} call is in progress.
+ */
 export function isSqlLogSuppressed(): boolean {
     return state.suppressed;
 }
 
-/** Run `fn` with SQL logging suppressed, restoring the previous state after. */
+/**
+ * Run `fn` with SQL logging suppressed.
+ *
+ * @remarks
+ * The previous state is restored in a `finally`, so nesting works and a throw
+ * still un-suppresses. What it does NOT do is scope the suppression to `fn`'s own
+ * queries — the flag is module-wide, so anything else querying concurrently is
+ * silenced for as long as `fn` runs.
+ *
+ * @param fn - Work to run while logging is suppressed.
+ * @returns Whatever `fn` resolves to.
+ * @example
+ * ```typescript
+ * await silently(() => client.$executeRawUnsafe(startupDdl));
+ * ```
+ */
 export async function silently<T>(fn: () => Promise<T>): Promise<T> {
     const previous = state.suppressed;
     state.suppressed = true;

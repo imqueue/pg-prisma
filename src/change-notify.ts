@@ -31,10 +31,23 @@ export const CHANGE_NOTIFY_TRIGGER_NAME = 'record_change_notify';
 /** Default name of the trigger's plpgsql notify function. */
 export const CHANGE_NOTIFY_FUNCTION_NAME = 'record_change_notify_fn';
 
+/** Which tables notify, and under which Postgres object names. */
 export interface ChangeTriggerConfig {
+    /** NOTIFY channel to publish on (default {@link CHANGE_NOTIFY_CHANNEL}). */
     channel?: string;
+    /** Trigger name to create on each table (default {@link CHANGE_NOTIFY_TRIGGER_NAME}). */
     triggerName?: string;
+    /** Name of the shared plpgsql function (default {@link CHANGE_NOTIFY_FUNCTION_NAME}). */
     functionName?: string;
+    /**
+     * Tables that should notify — the complete desired set, not an addition.
+     *
+     * @remarks
+     * Reconciliation is two-way: a table listed here without the trigger gets it,
+     * and a table that HAS the trigger but is not listed here has it dropped. So
+     * omitting `models` entirely (the default empty array) removes the trigger from
+     * every table it is currently on.
+     */
     models?: readonly string[];
     /** Suppress SQL logging for the install DDL (default `true`). */
     silent?: boolean;
@@ -42,14 +55,55 @@ export interface ChangeTriggerConfig {
 
 /** The raw-SQL surface used to install triggers (a Prisma client or its `tx`). */
 export interface RawExecutor {
+    /** Execute a statement — used for the DDL, which cannot use bind parameters. */
     $executeRawUnsafe(sql: string, ...values: unknown[]): Promise<unknown>;
+    /** Run a query — used to read the currently installed triggers back. */
     $queryRawUnsafe<T>(sql: string, ...values: unknown[]): Promise<T>;
 }
 
+/** A {@link RawExecutor} that can also open a transaction. */
 export interface RawClient extends RawExecutor {
+    /**
+     * Run `fn` inside a transaction.
+     *
+     * @remarks
+     * {@link installChangeTriggers} needs this so the whole reconciliation — the
+     * function, the added triggers and the dropped ones — either lands or does not.
+     */
     $transaction<T>(fn: (tx: RawExecutor) => Promise<T>): Promise<T>;
 }
 
+/**
+ * Install Postgres triggers that `NOTIFY` on every row change in the given tables.
+ *
+ * @remarks
+ * Creates one shared plpgsql function and attaches a row-level trigger to each
+ * table in `models`, firing after every insert, update and delete. Each
+ * notification is a JSON payload with three keys — `table`, `op` (`INSERT`,
+ * `UPDATE` or `DELETE`) and `row` — where `row` is the new row, or the OLD row for
+ * a delete. Listen for them with `@imqueue/pg-pubsub`, or any `LISTEN` client.
+ *
+ * The whole thing runs in one transaction and is idempotent, so it is safe on every
+ * start. It also reconciles in both directions: `models` is the complete desired
+ * set, read against `information_schema.triggers`, so a table that carries the
+ * trigger but is not listed has it dropped. Calling this with an empty or omitted
+ * `models` therefore REMOVES every trigger of that name — it is not a no-op.
+ *
+ * Two limits worth knowing. Postgres caps a notification payload at 8000 bytes and
+ * raises an error beyond it, so a table with large rows can make its own writes
+ * fail — this is unsuitable for wide or blob-bearing tables. And the trigger fires
+ * per row inside the writing transaction, so a bulk write produces one
+ * notification per row, delivered only if that transaction commits.
+ *
+ * @param client - A client that can execute raw SQL and open a transaction.
+ * @param config - Channel and object names, the tables to reconcile, and whether
+ *   to suppress SQL logging for the DDL.
+ * @returns Nothing; it resolves once the triggers match `models`.
+ * @example
+ * ```typescript
+ * await installChangeTriggers(prisma, { models: ['User', 'Order'] });
+ * ```
+ */
 export async function installChangeTriggers(
     client: RawClient,
     {

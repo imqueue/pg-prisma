@@ -24,11 +24,29 @@
 
 import { Prisma, type PrismaClient } from '@prisma/client/extension';
 
-/** Per-model soft-delete config: the `deletedAt` column name. */
+/**
+ * Which models are soft-deleted, and which column carries the stamp.
+ *
+ * @remarks
+ * Keyed by Prisma model name; the `deletedAt` value is the column that holds the
+ * deletion timestamp, so it does not have to be literally named `deletedAt`. A
+ * model absent from this map is untouched — its deletes are real deletes. The
+ * code generator emits this config from your schema, so it normally comes from
+ * there rather than being written by hand.
+ */
 export type SoftDeleteModels = Record<string, { deletedAt: string }>;
 
+/** Everything {@link softDelete} needs to build its extension. */
 export interface SoftDeleteOptions {
+    /**
+     * The UNEXTENDED Prisma client, used to reroute deletes into updates.
+     *
+     * @remarks
+     * Passing the extended client here would send the rerouted update back
+     * through this same extension.
+     */
     client: PrismaClient;
+    /** Which models are soft-deleted, and the column holding the stamp. */
     models: SoftDeleteModels;
 }
 
@@ -48,17 +66,42 @@ function excludeDeleted(
 }
 
 /**
- * Query extension turning soft-delete models' deletes into `deletedAt` stamps and
- * filtering soft-deleted rows out of top-level reads. Deletes also target only
- * live rows — re-deleting never overwrites the original stamp (a single `delete`
- * of an already-deleted row therefore throws not-found, like any absent row).
- * `findUnique` relies on extended where-unique: non-unique scalars (here
- * `deletedAt`) are valid extra filters alongside the unique key.
+ * Build the query extension that turns deletes into `deletedAt` stamps and hides
+ * stamped rows from reads.
  *
- * Caveat: reads *through relations* (nested `include`/`select` of a soft-delete
- * model from another model) are not intercepted and DO return soft-deleted
- * rows — filter explicitly at such call sites (e.g. `where: { deletedAt: null }`
- * on the nested relation) when it matters.
+ * @remarks
+ * For every model listed in `models`, `delete` and `deleteMany` become an
+ * `update`/`updateMany` that writes the current time into the configured column,
+ * and the read operations (`findMany`, `findFirst`, `findUnique`, their `OrThrow`
+ * variants and `count`) gain a `<column>: null` filter. Models not listed pass
+ * straight through, deletes included.
+ *
+ * Deletes themselves also filter on `<column>: null`, so only live rows are
+ * deletable and an original stamp is never overwritten by a second delete. The
+ * consequence is worth stating plainly: deleting an already-soft-deleted row
+ * throws not-found, exactly as deleting a row that was never there does.
+ *
+ * `findUnique` works here because Prisma's extended where-unique accepts
+ * non-unique scalars as extra filters alongside the unique key.
+ *
+ * The filter is applied to TOP-LEVEL reads only. A nested `include` or `select`
+ * that reaches a soft-deleted model through a relation is not intercepted, and it
+ * DOES return stamped rows; add `where: { deletedAt: null }` to the nested
+ * relation at those call sites when it matters.
+ *
+ * @param input - The unextended client and the per-model column config.
+ * @returns A Prisma extension to pass to `client.$extends()`.
+ * @example
+ * ```typescript
+ * const base = new PrismaClient();
+ * const client = base.$extends(softDelete({
+ *     client: base,
+ *     models: { User: { deletedAt: 'deletedAt' } },
+ * }));
+ *
+ * await client.user.delete({ where: { id } }); // stamps, does not remove
+ * await client.user.findMany();                // stamped rows are absent
+ * ```
  */
 export function softDelete({ client, models }: SoftDeleteOptions) {
     return Prisma.defineExtension({

@@ -41,10 +41,18 @@ export type AccessScopeModels = Record<string, Record<string, string[]>>;
  */
 export type AccessScopeResolver = () => string | string[] | null | undefined;
 
+/** Everything {@link accessScope} needs to build its extension. */
 export interface AccessScopeOptions {
     /** Scope columns per model per level (see the generated config). */
     models: AccessScopeModels;
-    /** One resolver per access level, keyed by level name. */
+    /**
+     * One resolver per access level, keyed by level name.
+     *
+     * @remarks
+     * A level named in `models` but missing here is skipped entirely, so an
+     * unregistered resolver silently widens access rather than denying it. Keep
+     * the two keyed consistently.
+     */
     resolvers: Record<string, AccessScopeResolver>;
 }
 
@@ -75,10 +83,23 @@ function levelFilter(
 }
 
 /**
- * Compose the access-scope `where` for a single model: each active level (its
- * resolver returns a value other than `undefined`) contributes an OR over its
- * columns, all AND-ed onto the caller's `where`. Returns `where` unchanged when
- * the model isn't scoped or no level is active. Pure — the extension applies it.
+ * Compose the access-scope `where` clause for a single model.
+ *
+ * @remarks
+ * Each active level — one whose resolver returns anything other than `undefined` —
+ * contributes an OR across its columns, and the level filters are AND-ed together
+ * and AND-ed onto the caller's own `where`. Nothing is merged by key, so a caller
+ * cannot widen or override the scope by supplying a condition on a scope column.
+ *
+ * This is the pure half of the mechanism, exported so the composition can be
+ * tested and reused directly; {@link accessScope} is what applies it to queries.
+ *
+ * @param where - The caller's own filter, or undefined.
+ * @param config - Scope columns per level for this one model, or undefined when
+ *   the model is not scoped.
+ * @param resolvers - One resolver per access level, keyed by level name.
+ * @returns The combined filter, or `where` unchanged when the model is not scoped
+ *   or no level is active — returned by identity, so callers can compare.
  */
 export function accessWhere(
     where: Record<string, unknown> | undefined,
@@ -110,17 +131,40 @@ export function accessWhere(
 type ReadArgs = { where?: Record<string, unknown> };
 
 /**
- * Query extension restricting a request to the records the active access levels
- * allow. For each scoped model, every level whose resolver returns a value (not
- * `undefined`) contributes an OR-over-its-columns filter; the level filters are
- * AND-ed together and AND-ed onto the caller's `where` — so a caller can never
- * widen out of scope, and no scope column can be spoofed. A level with a `null`
- * value denies (matches nothing); an array value becomes an `IN`.
+ * Build the query extension that restricts queries to the records the active
+ * access levels allow.
  *
- * Applies to reads and, in skip mode, to `update`/`delete` and their `*Many`
- * forms (a write silently affects only in-scope rows). `create` is left alone
- * (authorship stamps ownership; there is nothing to filter). Relations are never
- * touched — nested `where`/`include`/`select` are fetched as-is.
+ * @remarks
+ * For each scoped model, every level whose resolver returns a value contributes an
+ * OR across that level's columns; the level filters are AND-ed together and AND-ed
+ * onto the caller's `where`. A caller therefore cannot widen out of scope, and no
+ * scope column can be spoofed by supplying it in the query. A `null` from a
+ * resolver denies by matching nothing (`IN ()`), and an array becomes an `IN` —
+ * including an empty array, which also denies.
+ *
+ * Coverage is ten operations: the reads (`findMany`, `findFirst`, `findUnique`,
+ * their `OrThrow` variants and `count`) plus `update`, `updateMany`, `delete` and
+ * `deleteMany`. On the writes the effect is silent rather than an error — an
+ * out-of-scope `updateMany` simply affects no rows, and an out-of-scope `update`
+ * throws the ordinary not-found. `create` is deliberately untouched: there is no
+ * existing row to filter, and ownership is stamped by {@link authorship}.
+ *
+ * Relations are never touched. A nested `where`, `include` or `select` is fetched
+ * as-is, so reaching a scoped model through a relation bypasses the scope — filter
+ * explicitly at those call sites when it matters.
+ *
+ * @param input - The per-model scope config and one resolver per level.
+ * @returns A Prisma extension to pass to `client.$extends()`.
+ * @example
+ * ```typescript
+ * const client = new PrismaClient().$extends(accessScope({
+ *     models: ACCESS_SCOPE_MODELS,
+ *     resolvers: {
+ *         // undefined for an admin: the level does not constrain them at all
+ *         tenant: () => context.get()?.tenantId,
+ *     },
+ * }));
+ * ```
  */
 export function accessScope({ models, resolvers }: AccessScopeOptions) {
     const restrict = (model: string, args: unknown): void => {

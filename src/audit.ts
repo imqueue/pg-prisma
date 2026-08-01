@@ -24,6 +24,24 @@
 
 import { Prisma, type PrismaClient } from '@prisma/client/extension';
 
+/**
+ * The three kinds of write recorded in the audit trail.
+ *
+ * @remarks
+ * These are the literal strings written to the audit table's action column, so
+ * they are part of the stored data, not just an internal enum — a reader querying
+ * the trail matches on `'INSERT'`, `'UPDATE'` or `'DELETE'`.
+ *
+ * The mapping from Prisma operations is not one-to-one: `create` records `INSERT`,
+ * `update` and `updateMany` record `UPDATE`, `delete` and `deleteMany` record
+ * `DELETE`. A soft delete is recorded as `DELETE`, since it is the caller's
+ * `delete` that is seen — but only when {@link audit} is added before
+ * {@link softDelete}, because the reroute goes to the unextended client and
+ * otherwise never reaches the audit extension at all.
+ *
+ * The value and the type share a name and a page, as the const-plus-derived-union
+ * idiom requires.
+ */
 export const AuditAction = {
     INSERT: 'INSERT',
     UPDATE: 'UPDATE',
@@ -36,45 +54,122 @@ function recordKey(rec: Record<string, unknown>): string | null {
     return rec.id !== undefined && rec.id !== null ? String(rec.id) : null;
 }
 
-/** Column names of the audit target model (see the generated `AUDIT_CONFIG`). */
+/**
+ * Column names in the audit target table.
+ *
+ * @remarks
+ * Every name is required, because the rows are written with raw SQL that quotes
+ * these identifiers directly — there is no Prisma model to fall back on. The code
+ * generator emits this as `AUDIT_CONFIG`, so it normally comes from your schema
+ * rather than being written by hand.
+ */
 export interface AuditColumns {
+    /** Column holding the JSON actor, as returned by `getPrincipal`. */
     principal: string;
+    /**
+     * Column holding the action string.
+     *
+     * @remarks
+     * One of the three {@link (AuditAction:variable) | AuditAction} values. The member
+     * selector is required because the const and the type share the name, and an
+     * ambiguous `{@link}` renders as nothing at all rather than as an error.
+     */
     action: string;
+    /** Column holding the name of the model that was written. */
     model: string;
+    /** Column holding the affected record's `id`, or `'many'` for a bulk write. */
     recordId: string;
+    /** Column holding the JSON payload: the record, or the args plus a count. */
     changes: string;
+    /** Column stamped with the database's `now()` at insert time. */
     createdAt: string;
 }
 
-/** Audit config: the target model and its column names. */
+/** Where the audit trail is written, and under which column names. */
 export interface AuditConfig {
+    /**
+     * Table the trail is inserted into.
+     *
+     * @remarks
+     * Named `model` for symmetry with the rest of the config, but it is used as a
+     * raw table name — it need not be a Prisma model at all, which is the point of
+     * writing the trail with raw SQL.
+     */
     model: string;
+    /** Column names within that table. */
     columns: AuditColumns;
 }
 
+/** Everything {@link audit} needs to build its extension. */
 export interface AuditOptions {
+    /**
+     * The UNEXTENDED Prisma client, used to write the audit rows.
+     *
+     * @remarks
+     * Deliberately unextended: audit rows written through the extended client
+     * would themselves be audited.
+     */
     client: PrismaClient;
+    /** Where the trail goes and what its columns are called. */
     config: AuditConfig;
     /** Models whose writes are recorded to the audit log. */
     models: ReadonlySet<string>;
+    /**
+     * Resolves the actor to record, or a falsy value to record none.
+     *
+     * @remarks
+     * Called per write and serialized with `JSON.stringify`, so it can return any
+     * shape you want stored. Resolving it lazily is what keeps this extension
+     * ignorant of where the actor comes from — a request context, an auth token,
+     * or nothing at all.
+     */
     getPrincipal: () => unknown;
 }
 
 /**
- * Query extension recording every write to an audited model into the audit
- * target table (`audit.table`, columns `audit.columns`) via raw SQL — so the
- * target table and its column names are configurable and need not be a Prisma
- * model. Single-row `create`/`update`/`delete` capture the affected record
- * (keyed by `id`); `updateMany`/`deleteMany` record the args + affected count
- * under `recordId: 'many'`. Writes go through the unextended `client` so audit
- * rows are never themselves audited, and are fire-and-forget: a failed audit
- * write is swallowed, never thrown (and never logged). The actor is resolved
- * lazily via `getPrincipal` so this stays decoupled from the transport.
+ * Build the query extension that records every write to an audited model.
  *
- * Ordering: when combined with extensions that reroute operations to another
- * client (e.g. `softDelete` turning deletes into updates), this extension must
- * be added FIRST — the first-added query hook is the outermost — or those
- * operations vanish from the trail before it sees them.
+ * @remarks
+ * Rows are inserted into `config.model` under the names in `config.columns`,
+ * using raw SQL rather than a Prisma model — which is what lets the trail live in
+ * a table Prisma knows nothing about. The row id is generated by Postgres
+ * (`gen_random_uuid()`) because a Prisma-level `@default(uuid())` on the target is
+ * client-side and never applies to a raw insert.
+ *
+ * What gets captured depends on the operation. `create`, `update` and `delete`
+ * record the affected record itself, keyed by its `id`. `updateMany` and
+ * `deleteMany` cannot identify rows, so they record the query args and the
+ * affected count under the literal `recordId` of `'many'`. A model absent from
+ * `models` is not recorded, and neither is a single-row write whose result has no
+ * `id` — every audited model is assumed to carry a surrogate `id`.
+ *
+ * Auditing is fire-and-forget by design: the insert is not awaited, and a failure
+ * is swallowed rather than thrown or logged. A write therefore never fails
+ * because its audit row could not be stored — and equally, a broken audit
+ * configuration is silent. Verify it once against a real table rather than
+ * trusting that no error means it is working.
+ *
+ * Ordering matters when this is combined with an extension that reroutes an
+ * operation to another client — {@link softDelete} turning a delete into an
+ * update is exactly that. Prisma runs the first-added query hook outermost, so
+ * `audit` must be added FIRST or the rerouted operation never reaches it and
+ * vanishes from the trail.
+ *
+ * @param input - The unextended client, the target config, the audited model
+ *   names, and the actor resolver.
+ * @returns A Prisma extension to pass to `client.$extends()`.
+ * @example
+ * ```typescript
+ * const base = new PrismaClient();
+ * const client = base
+ *     .$extends(audit({
+ *         client: base,
+ *         config: AUDIT_CONFIG,
+ *         models: new Set(['User']),
+ *         getPrincipal: () => context.get()?.user ?? null,
+ *     }))
+ *     .$extends(softDelete({ client: base, models: SOFT_DELETE_MODELS }));
+ * ```
  */
 export function audit({ client, config, models, getPrincipal }: AuditOptions) {
     const { model: auditModel, columns: col } = config;
