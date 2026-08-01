@@ -61,9 +61,30 @@ const CLAUSE = new RegExp(`\\b(${KEYWORDS.join('|')})\\b`, 'gi');
 const INDENT = /^(AND|OR|LEFT JOIN|RIGHT JOIN|INNER JOIN|CROSS JOIN|JOIN)\b/i;
 
 /**
- * Format a one-line SQL string for readable logs: collapse whitespace,
- * upper-case and break before major keywords, and indent boolean/join
- * continuations. Purely cosmetic and best-effort — not a real SQL parser.
+ * Format a one-line SQL string so it is readable in a log.
+ *
+ * @remarks
+ * Three passes: runs of whitespace collapse to single spaces, every major keyword
+ * is upper-cased and moved onto a new line, and continuation clauses (`AND`, `OR`
+ * and the `JOIN` family) are indented one level under the statement they belong
+ * to. Longer keywords are matched before their prefixes, so `WITH RECURSIVE` and
+ * `LEFT JOIN` survive intact rather than breaking at `WITH` and `JOIN`.
+ *
+ * Purely cosmetic and deliberately not a SQL parser. Matching is a word-boundary
+ * regex over a fixed keyword list, which is why a keyword inside an identifier is
+ * left alone but a keyword inside a string literal is not — it will be
+ * upper-cased and broken like any other. Use it for logs, never to rewrite SQL
+ * you intend to execute.
+ *
+ * @param sql - A SQL statement, typically as captured by a query log.
+ * @returns The same statement across multiple indented lines.
+ * @example
+ * ```typescript
+ * prettifySql('select id from "User" where active = $1');
+ * // SELECT id
+ * // FROM "User"
+ * // WHERE active = $1
+ * ```
  */
 export function prettifySql(sql: string): string {
     const broken = sql

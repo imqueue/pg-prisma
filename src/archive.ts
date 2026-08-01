@@ -22,37 +22,21 @@
  * <support@imqueue.com> to get commercial licensing options.
  */
 
-/**
- * Archiving installer — moves aged rows out of watched tables into a mirror
- * `archive` schema on a schedule, keeping the hot tables small.
- *
- * Idempotent DB setup (safe to run on every start):
- *  1. create the archive schema (default `archive`, configurable);
- *  2. create its settings table (default `_settings`) — one row per watched
- *     table: the source schema, the watch column (default `deletedAt`), the
- *     retention period in seconds (default 30 days), an `enabled` flag, and a
- *     `hash` of the code-desired config (source schema + watch column + period);
- *  3. reconcile each supplied table: insert if new, and if the code-desired
- *     `hash` differs from the stored one, rewrite the code-owned columns (source
- *     schema, watch column, period). When the hash is unchanged, operator edits
- *     to those columns are preserved; the `enabled` toggle is always preserved;
- *  4. create the `run()` sweep function — for each enabled setting, if any row
- *     is older than its period it lazily creates `archive.<table>` (only when
- *     rows actually appear) and moves the aged rows there;
- *  5. best-effort schedule `run()` via pg_cron — try to create the extension; if
- *     it isn't available, skip scheduling (no error). The schedule is
- *     reconciled: any stale cron job pointing at `run()` (a changed job name or
- *     schedule) is unscheduled and the desired job (re)created. `run()` can also
- *     be called manually or wired to any external scheduler.
- *
- * Library-clean: every input is a parameter and it touches no globals.
- */
-
 import { createHash } from 'node:crypto';
 import { silently } from './sql-log.js';
 
 /** The raw-SQL surface this installer needs (a Prisma client or its `tx`). */
 export interface ArchiveClient {
+    /**
+     * Execute a statement built by the installer.
+     *
+     * @remarks
+     * Named `Unsafe` because it interpolates rather than binds, which is what DDL
+     * requires — schema, table and column names cannot be parameters. Every
+     * identifier the installer interpolates is validated against
+     * `/^[A-Za-z_][A-Za-z0-9_]*$/` first, and it throws rather than quoting
+     * anything that fails.
+     */
     $executeRawUnsafe(sql: string, ...values: unknown[]): Promise<unknown>;
 }
 
@@ -68,7 +52,9 @@ export interface ArchivableModel {
     sourceSchema?: string;
 }
 
+/** Everything {@link installArchiving} needs. */
 export interface InstallArchiveOptions {
+    /** The raw-SQL surface to install through — a Prisma client or a transaction. */
     client: ArchiveClient;
     /** Archive schema name (default `archive`). */
     archiveSchema?: string;
@@ -103,8 +89,55 @@ function assertIdent(value: string, what: string): void {
 const lit = (value: string): string => value.replace(/'/g, "''");
 
 /**
- * Install (idempotently) the archive schema, settings table, sweep function, and
- * — best-effort — the pg_cron schedule. See the module docs for the model.
+ * Install the row-archiving machinery: a mirror `archive` schema, its settings
+ * table, the sweep function, and — best effort — a pg_cron schedule to run it.
+ *
+ * @remarks
+ * Aged rows are moved out of the watched tables into same-named tables in the
+ * archive schema, which keeps the hot tables small without losing the data. Every
+ * step is idempotent, so this is safe to call on every start.
+ *
+ * What it does, in order:
+ *
+ * 1. Creates the archive schema.
+ * 2. Creates its settings table, one row per watched table: the source schema, the
+ *    watch column, the retention period in seconds, an `enabled` flag, and a hash
+ *    of the config the code asked for.
+ * 3. Reconciles the supplied `models` against that table — inserting new rows, and
+ *    rewriting the code-owned columns only when the hash differs.
+ * 4. Creates the `run()` sweep function. For each enabled setting it checks
+ *    whether any row is older than that setting's period, and only then creates
+ *    `archive.<table>` and moves the aged rows across in a single
+ *    `DELETE ... RETURNING` piped into an `INSERT`. So the archive table appears
+ *    when there is finally something to put in it, not at install time.
+ * 5. Tries to create the pg_cron extension and schedule `run()`. This step is
+ *    best effort: if pg_cron is unavailable the failure is caught and scheduling
+ *    is skipped without an error, which means a successful call does NOT guarantee
+ *    the sweep is scheduled. `run()` is a plain function, so it can equally be
+ *    called by hand or driven by any external scheduler.
+ *
+ * The division of ownership in step 3 is the part worth understanding. While the
+ * hash is unchanged, an operator's edits to the source schema, watch column and
+ * period are preserved — the code will not clobber them on the next start.
+ * Changing any of those three in code changes the hash, and then the code's values
+ * win. The `enabled` flag is never written after the initial insert, so turning a
+ * table off in the database keeps it off regardless.
+ *
+ * `run()` reads the settings table at call time rather than baking them in, so
+ * operator changes take effect on the next sweep without reinstalling.
+ *
+ * @param options - Client, naming, defaults, the tables to watch, and the schedule.
+ * @returns Nothing; it resolves once the DDL has been applied.
+ * @throws Error when any schema, table or column name is not a plain SQL
+ *   identifier — these are interpolated into DDL, so they are validated rather
+ *   than escaped.
+ * @example
+ * ```typescript
+ * await installArchiving({
+ *     client: prisma,
+ *     models: [{ name: 'AuditLog', periodSeconds: 7 * 24 * 3600 }],
+ * });
+ * ```
  */
 export async function installArchiving(
     options: InstallArchiveOptions,

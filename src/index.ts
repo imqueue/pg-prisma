@@ -27,7 +27,6 @@ export * from './archive.js';
 export * from './audit.js';
 export * from './authorship.js';
 export * from './change-notify.js';
-export * from './codegen.js';
 export * from './iso-dates.js';
 export * from './migrate-down.js';
 export * from './pretty-sql.js';

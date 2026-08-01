@@ -45,9 +45,25 @@ function toIsoDates(value: unknown): unknown {
 }
 
 /**
- * Query extension serializing every `Date` in a query result to an ISO string,
- * so wire values match the generated models (which type `DateTime` as `string`,
- * per the codegen `scalars` config).
+ * Build the query extension that serializes every `Date` in a query result to an
+ * ISO-8601 string.
+ *
+ * @remarks
+ * The generated `@imqueue/rpc` models type Prisma's `DateTime` as `string` (the
+ * codegen `scalars` config decides this), so a service that returned Prisma's own
+ * `Date` objects would be handing callers a shape its own types disagree with.
+ * This extension closes that gap at the boundary rather than at every call site.
+ *
+ * Conversion walks the whole result recursively — arrays, nested objects and
+ * relations included — and leaves structure and every non-`Date` value untouched.
+ * It applies to results only: `Date` values you pass IN as query arguments are
+ * still handed to Prisma as `Date`.
+ *
+ * @returns A Prisma extension to pass to `client.$extends()`.
+ * @example
+ * ```typescript
+ * const client = new PrismaClient().$extends(isoDates());
+ * ```
  */
 export function isoDates() {
     return Prisma.defineExtension({
