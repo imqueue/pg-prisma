@@ -31,6 +31,27 @@ import { fileURLToPath } from 'node:url';
 const HERE = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = join(HERE, '..', '..');
 
+/** Everything the package publishes at runtime, in sorted order. */
+const EXPORTS = [
+    'AuditAction',
+    'CHANGE_NOTIFY_CHANNEL',
+    'CHANGE_NOTIFY_FUNCTION_NAME',
+    'CHANGE_NOTIFY_TRIGGER_NAME',
+    'accessScope',
+    'accessWhere',
+    'audit',
+    'authorship',
+    'installArchiving',
+    'installChangeTriggers',
+    'isSqlLogSuppressed',
+    'isoDates',
+    'migrateDown',
+    'prettifySql',
+    'silently',
+    'softDelete',
+    'toIsoDates',
+];
+
 // The package is ESM, but Node >= 22 lets CommonJS `require()` an ESM module —
 // UNLESS some module in the graph is async (top-level await), which fails hard
 // with ERR_REQUIRE_ASYNC_MODULE. Two things put an async module in this graph and
@@ -50,13 +71,25 @@ test('the package barrel is require()-able from CommonJS', () => {
         [
             '-e',
             'const m = require(process.argv[1]);' +
-                'console.log(Object.keys(m).length)',
+                'console.log(Object.keys(m).sort().join(","))',
             join(ROOT, 'index.js'),
         ],
         { encoding: 'utf8', cwd: ROOT },
     );
 
-    assert.equal(Number(out.trim()), 16, 'expected 16 runtime exports');
+    /*
+     * The names rather than a count, because a count cannot say what moved.
+     * "expected 16 runtime exports" is what this said when an export was added
+     * deliberately, and it sends the reader to the wrong question — whether the
+     * barrel broke — when the answer is simply that the surface changed and
+     * this list is where it is written down.
+     *
+     * Which makes the assertion do two jobs: the require() itself is the one
+     * that matters, since an async module anywhere in the graph fails it
+     * outright, and the list is the package's public surface, changed on
+     * purpose or not at all.
+     */
+    assert.deepEqual(out.trim().split(','), EXPORTS);
 });
 
 test('the barrel exports the same names to ESM and CommonJS', async () => {

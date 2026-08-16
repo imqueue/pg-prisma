@@ -125,7 +125,35 @@ export function accessWhere(
         return where;
     }
 
-    return { AND: [...(where ? [where] : []), ...filters] };
+    /*
+     * The caller's own conditions stay at the top level; only ours go into
+     * `AND`.
+     *
+     * Nesting the caller's `where` inside `AND` — which this did — is correct
+     * for `findMany` and silently fatal for `update`, `delete` and
+     * `findUnique`. Those take a `WhereUniqueInput`, and Prisma requires a
+     * unique field to appear at the *top level* of it: moving `id` one level
+     * down leaves the argument with no unique field at all, and Prisma refuses
+     * the call outright rather than filtering anything. Every scoped update in
+     * a service using this extension therefore threw a validation error, in
+     * scope or out — and a service that logs rather than rethrows reports that
+     * to its caller as a save that succeeded and changed nothing.
+     *
+     * Spreading is exactly as safe as nesting. Top-level conditions and `AND`
+     * conjoin, so a caller supplying their own value for a scope column gets
+     * ours as well and cannot widen past it; a caller's own `AND` is kept
+     * rather than overwritten, which is the one key that would otherwise be
+     * lost by spreading.
+     */
+    const { AND: callerAnd, ...rest } = where ?? {};
+    const conjoined =
+        callerAnd === undefined
+            ? []
+            : Array.isArray(callerAnd)
+              ? callerAnd
+              : [callerAnd];
+
+    return { ...rest, AND: [...conjoined, ...filters] };
 }
 
 type ReadArgs = { where?: Record<string, unknown> };
@@ -173,8 +201,9 @@ export function accessScope({ models, resolvers }: AccessScopeOptions) {
             return;
         }
         const a = args as ReadArgs;
-        // AND our filters onto the caller's `where` (never merged by key) so the
-        // scope cannot be removed or overridden by caller-supplied conditions.
+        // AND our filters onto the caller's `where` — as a conjunction, never
+        // merged into their keys — so the scope cannot be removed or overridden
+        // by caller-supplied conditions.
         const scoped = accessWhere(a.where, config, resolvers);
         if (scoped !== a.where) {
             a.where = scoped;
