@@ -1,6 +1,6 @@
 {
   "name": "@imqueue/pg-prisma",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Prisma/Postgres toolkit for Node.js & TypeScript microservices — query extensions (soft-delete, audit, authorship, access-scope), row archiving, change-notify triggers, down-migrations, and a Prisma generator for typed @imqueue/rpc models (the @imqueue framework)",
   "keywords": [
     "prisma",
