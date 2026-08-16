@@ -130,7 +130,8 @@ test('the caller where is preserved and AND-ed, never replaced', () => {
         resolvers({ user: 'u1' }),
     );
     assert.deepEqual(out, {
-        AND: [{ active: true }, { OR: [{ createdBy: 'u1' }] }],
+        active: true,
+        AND: [{ OR: [{ createdBy: 'u1' }] }],
     });
 });
 
@@ -141,4 +142,62 @@ test('a missing resolver for a configured level is skipped', () => {
         resolvers({ user: 'u1' }), // no `portfolio` resolver at all
     );
     assert.deepEqual(out, { AND: [{ OR: [{ createdBy: 'u1' }] }] });
+});
+
+/*
+ * The regression the rest of this file exists for.
+ *
+ * `update`, `delete` and `findUnique` take a `WhereUniqueInput`, and Prisma
+ * requires a unique field at its *top level*. Nesting the caller's `where`
+ * inside `AND` — which this did — left the argument with no unique field, so
+ * Prisma refused the call instead of scoping it, and every scoped update in
+ * every service using this extension failed.
+ */
+test('a unique field stays at the top level, where update needs it', () => {
+    const out = accessWhere(
+        { id: 'r1' },
+        { portfolio: ['portfolioId'] },
+        resolvers({ portfolio: ['p1'] }),
+    );
+    assert.deepEqual(out, {
+        id: 'r1',
+        AND: [{ OR: [{ portfolioId: { in: ['p1'] } }] }],
+    });
+});
+
+test("the caller's own AND is conjoined rather than overwritten", () => {
+    const out = accessWhere(
+        { id: 'r1', AND: [{ active: true }] },
+        { portfolio: ['portfolioId'] },
+        resolvers({ portfolio: ['p1'] }),
+    );
+    assert.deepEqual(out, {
+        id: 'r1',
+        AND: [{ active: true }, { OR: [{ portfolioId: { in: ['p1'] } }] }],
+    });
+});
+
+test('a single-object AND from the caller is conjoined too', () => {
+    const out = accessWhere(
+        { id: 'r1', AND: { active: true } },
+        { portfolio: ['portfolioId'] },
+        resolvers({ portfolio: ['p1'] }),
+    );
+    assert.deepEqual(out, {
+        id: 'r1',
+        AND: [{ active: true }, { OR: [{ portfolioId: { in: ['p1'] } }] }],
+    });
+});
+
+test('a caller condition on a scope column is kept, so it cannot widen', () => {
+    const out = accessWhere(
+        { portfolioId: 'p9' },
+        { portfolio: ['portfolioId'] },
+        resolvers({ portfolio: ['p1'] }),
+    );
+    // Both conditions apply: asking for p9 under a p1 scope matches nothing.
+    assert.deepEqual(out, {
+        portfolioId: 'p9',
+        AND: [{ OR: [{ portfolioId: { in: ['p1'] } }] }],
+    });
 });
