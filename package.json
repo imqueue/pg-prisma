@@ -39,7 +39,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git://github.com/imqueue/pg-prisma.git"
+    "url": "git+https://github.com/imqueue/pg-prisma.git"
   },
   "bugs": {
     "url": "https://github.com/imqueue/pg-prisma/issues"
