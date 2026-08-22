@@ -1,6 +1,8 @@
 # @imqueue/pg-prisma
 
-[![License](https://img.shields.io/badge/license-GPL-blue.svg)](https://rawgit.com/imqueue/pg-prisma/master/LICENSE)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/imqueue/pg-prisma/build.yml)](https://github.com/imqueue/pg-prisma/actions/workflows/build.yml)
+[![npm version](https://img.shields.io/npm/v/@imqueue/pg-prisma)](https://www.npmjs.com/package/@imqueue/pg-prisma)
+[![License](https://img.shields.io/badge/license-GPL-blue.svg)](https://github.com/imqueue/pg-prisma/blob/master/LICENSE)
 
 A Prisma/Postgres toolkit for Node.js & TypeScript back-ends — the persistence
 helpers behind @imqueue framework services. It bundles a set of Prisma
@@ -15,7 +17,9 @@ log formatting), and a Prisma generator that emits typed
 closed-source products at [imqueue.com](https://imqueue.com/).
 
 **Using an AI assistant?** Point it at [imqueue.org/llms.txt](https://imqueue.org/llms.txt)
-for a machine-readable index of the docs, or see [AGENTS.md](./AGENTS.md).
+for a machine-readable index of the docs, or see [AGENTS.md](./AGENTS.md). Current
+version, licence and Node floor for every package:
+[imqueue.org/status.json](https://imqueue.org/status.json).
 
 **Related packages:**
 
