@@ -24,7 +24,11 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { installChangeTriggers } from '../../src/change-notify.js';
+import {
+    CHANGE_NOTIFY_SUPPRESS_SETTING,
+    installChangeTriggers,
+    withoutChangeNotify,
+} from '../../src/change-notify.js';
 
 interface Installed {
     schema: string;
@@ -147,5 +151,68 @@ describe('installChangeTriggers()', () => {
         });
 
         assert.deepEqual(db.queries[0]?.values[1], ['public', 'tenant_a']);
+    });
+});
+
+describe('withoutChangeNotify()', () => {
+    it('sets the suppression only for its own transaction', async () => {
+        const db = client();
+
+        await withoutChangeNotify(db, async tx => {
+            await tx.$executeRawUnsafe('INSERT INTO "Term" VALUES (1)');
+        });
+
+        assert.equal(
+            db.statements[0],
+            `SET LOCAL "${CHANGE_NOTIFY_SUPPRESS_SETTING}" = 'on'`,
+            'the setting is LOCAL, so it reverts with the transaction',
+        );
+        assert.match(db.statements[1] ?? '', /INSERT INTO "Term"/);
+    });
+
+    it('hands the transaction to the caller, not the outer client', async () => {
+        const db = client();
+        let handed: unknown;
+
+        await withoutChangeNotify(db, async tx => {
+            handed = tx;
+        });
+
+        assert.ok(handed, 'writes issued elsewhere would notify as usual');
+    });
+
+    it('returns what the work returns', async () => {
+        const db = client();
+
+        assert.equal(await withoutChangeNotify(db, async () => 42), 42);
+    });
+
+    it('takes a different setting when the trigger was given one', async () => {
+        const db = client();
+
+        await withoutChangeNotify(db, async () => undefined, 'app.quiet');
+
+        assert.equal(db.statements[0], `SET LOCAL "app.quiet" = 'on'`);
+    });
+});
+
+describe('the trigger body', () => {
+    it('returns early while the suppression is set', async () => {
+        const db = client();
+
+        await installChangeTriggers(db, { models: ['User'] });
+
+        const fn = db.statements.find(one => one.includes('pg_notify')) ?? '';
+
+        assert.match(
+            fn,
+            new RegExp(
+                `current_setting\\('${CHANGE_NOTIFY_SUPPRESS_SETTING}', true\\)`,
+            ),
+        );
+        assert.ok(
+            fn.indexOf('RETURN NULL') < fn.indexOf('pg_notify'),
+            'it gives up before building a payload, not after',
+        );
     });
 });

@@ -30,6 +30,15 @@ export const CHANGE_NOTIFY_CHANNEL = 'record_change_notify';
 export const CHANGE_NOTIFY_TRIGGER_NAME = 'record_change_notify';
 /** Default name of the trigger's plpgsql notify function. */
 export const CHANGE_NOTIFY_FUNCTION_NAME = 'record_change_notify_fn';
+/**
+ * Setting the trigger reads to decide whether to stay quiet.
+ *
+ * @remarks
+ * A custom GUC rather than `session_replication_role`, which would also switch
+ * off foreign-key enforcement — a bulk load run that way can leave orphan rows
+ * behind. This suppresses nothing but these notifications.
+ */
+export const CHANGE_NOTIFY_SUPPRESS_SETTING = 'imq.notify_suppressed';
 
 /** Which tables notify, and under which Postgres object names. */
 export interface ChangeTriggerConfig {
@@ -39,6 +48,11 @@ export interface ChangeTriggerConfig {
     triggerName?: string;
     /** Name of the shared plpgsql function (default {@link CHANGE_NOTIFY_FUNCTION_NAME}). */
     functionName?: string;
+    /**
+     * Setting that silences the trigger (default
+     * {@link CHANGE_NOTIFY_SUPPRESS_SETTING}).
+     */
+    suppressSetting?: string;
     /**
      * Default schema of the listed tables (default `public`).
      *
@@ -144,6 +158,7 @@ export async function installChangeTriggers(
         triggerName = CHANGE_NOTIFY_TRIGGER_NAME,
         functionName = CHANGE_NOTIFY_FUNCTION_NAME,
         schema = 'public',
+        suppressSetting = CHANGE_NOTIFY_SUPPRESS_SETTING,
         models = [],
         silent = true,
     }: ChangeTriggerConfig,
@@ -155,6 +170,11 @@ export async function installChangeTriggers(
             DECLARE
                 rec record;
             BEGIN
+                IF coalesce(
+                    current_setting('${suppressSetting}', true), ''
+                ) = 'on' THEN
+                    RETURN NULL;
+                END IF;
                 IF TG_OP = 'DELETE' THEN rec := OLD; ELSE rec := NEW; END IF;
                 PERFORM pg_notify(
                     TG_ARGV[0],
@@ -220,4 +240,51 @@ export async function installChangeTriggers(
         });
 
     await (silent ? silently(install) : install());
+}
+
+/**
+ * Run `fn` in a transaction whose row changes notify nobody.
+ *
+ * @remarks
+ * For a bulk write — an import, a backfill, a reconciliation — where the
+ * trigger would otherwise emit one notification per row. Forty thousand rows
+ * is forty thousand payloads through a single Postgres notification queue, to
+ * tell listeners something they would rather hear once.
+ *
+ * The suppression is `SET LOCAL`, so it belongs to this transaction alone: it
+ * reverts on commit or rollback, and no concurrent session is affected. It is
+ * a setting the trigger itself reads, **not** `session_replication_role` — that
+ * would silence foreign-key enforcement too, and a bulk load run under it can
+ * commit orphan rows.
+ *
+ * Do the writes on the `tx` handed to `fn`. Writes issued on the outer client
+ * go out on a different connection, where the setting was never applied, and
+ * will notify as usual.
+ *
+ * Nothing is emitted afterwards to say what changed — a caller that suppresses
+ * is telling listeners it will account for the change itself, by bumping a
+ * revision, invalidating a tag, or announcing the import once when it is done.
+ *
+ * @param client - A client that can open a transaction.
+ * @param fn - Work to run with notifications suppressed.
+ * @param setting - Setting the trigger reads (default
+ *   {@link CHANGE_NOTIFY_SUPPRESS_SETTING}).
+ * @returns Whatever `fn` resolves to.
+ * @example
+ * ```typescript
+ * await withoutChangeNotify(prisma, async tx => {
+ *     await tx.$executeRawUnsafe(bulkUpsert);
+ * });
+ * ```
+ */
+export async function withoutChangeNotify<T>(
+    client: RawClient,
+    fn: (tx: RawExecutor) => Promise<T>,
+    setting: string = CHANGE_NOTIFY_SUPPRESS_SETTING,
+): Promise<T> {
+    return client.$transaction(async tx => {
+        await tx.$executeRawUnsafe(`SET LOCAL "${setting}" = 'on'`);
+
+        return fn(tx);
+    });
 }

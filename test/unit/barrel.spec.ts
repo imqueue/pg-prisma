@@ -36,6 +36,7 @@ const EXPORTS = [
     'AuditAction',
     'CHANGE_NOTIFY_CHANNEL',
     'CHANGE_NOTIFY_FUNCTION_NAME',
+    'CHANGE_NOTIFY_SUPPRESS_SETTING',
     'CHANGE_NOTIFY_TRIGGER_NAME',
     'accessScope',
     'accessWhere',
@@ -50,6 +51,7 @@ const EXPORTS = [
     'silently',
     'softDelete',
     'toIsoDates',
+    'withoutChangeNotify',
 ];
 
 // The package is ESM, but Node >= 22 lets CommonJS `require()` an ESM module —
