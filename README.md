@@ -42,7 +42,9 @@ version, licence and Node floor for every package:
 - **Row archiving** — moves aged rows out of hot tables into a mirror `archive`
   schema on a pg_cron schedule (idempotent DB setup).
 - **Change-notify triggers** — installs Postgres `NOTIFY` triggers for row
-  changes.
+  changes, reporting the schema alongside the table so tables of the same name
+  in different schemas are told apart. `withoutChangeNotify()` lets a bulk
+  write commit without a notification per row.
 - **Down-migrations** — `migrateDown()` undoes applied Prisma migrations (Prisma
   has no native "down").
 - **SQL log helpers** — `prettifySql()` and cooperative log suppression.
