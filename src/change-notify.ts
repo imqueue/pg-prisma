@@ -40,13 +40,26 @@ export interface ChangeTriggerConfig {
     /** Name of the shared plpgsql function (default {@link CHANGE_NOTIFY_FUNCTION_NAME}). */
     functionName?: string;
     /**
+     * Default schema of the listed tables (default `public`).
+     *
+     * @remarks
+     * A model may name its own schema as `schema.Table`, which wins over this.
+     * That is what lets a service reconcile tables it creates at run time —
+     * a tenant schema, say — without naming the default one.
+     */
+    schema?: string;
+    /**
      * Tables that should notify — the complete desired set, not an addition.
      *
      * @remarks
      * Reconciliation is two-way: a table listed here without the trigger gets it,
-     * and a table that HAS the trigger but is not listed here has it dropped. So
-     * omitting `models` entirely (the default empty array) removes the trigger from
-     * every table it is currently on.
+     * and a table that HAS the trigger but is not listed here has it dropped.
+     *
+     * It is confined to the schemas these names mention, so a call listing only
+     * public tables leaves triggers in other schemas alone — otherwise a service
+     * that installs per-schema would tear down its own work on the next start.
+     * Within those schemas it is absolute: omitting `models` entirely removes the
+     * trigger from every table in the default schema.
      */
     models?: readonly string[];
     /** Suppress SQL logging for the install DDL (default `true`). */
@@ -73,21 +86,41 @@ export interface RawClient extends RawExecutor {
     $transaction<T>(fn: (tx: RawExecutor) => Promise<T>): Promise<T>;
 }
 
+/** A model name as `schema` and `table`, taking `fallback` when unqualified. */
+function split(
+    model: string,
+    fallback: string,
+): { schema: string; table: string } {
+    const dot = model.indexOf('.');
+
+    return dot === -1
+        ? { schema: fallback, table: model }
+        : { schema: model.slice(0, dot), table: model.slice(dot + 1) };
+}
+
+const qualify = (schema: string, table: string): string => `${schema}.${table}`;
+
 /**
  * Install Postgres triggers that `NOTIFY` on every row change in the given tables.
  *
  * @remarks
  * Creates one shared plpgsql function and attaches a row-level trigger to each
  * table in `models`, firing after every insert, update and delete. Each
- * notification is a JSON payload with three keys — `table`, `op` (`INSERT`,
- * `UPDATE` or `DELETE`) and `row` — where `row` is the new row, or the OLD row for
- * a delete. Listen for them with `@imqueue/pg-pubsub`, or any `LISTEN` client.
+ * notification is a JSON payload with four keys — `schema`, `table`, `op`
+ * (`INSERT`, `UPDATE` or `DELETE`) and `row` — where `row` is the new row, or the
+ * OLD row for a delete. `schema` is what makes a listener able to tell two tables
+ * of the same name apart, which is the ordinary case once a service creates
+ * schemas of its own. Listen for them with `@imqueue/pg-pubsub`, or any `LISTEN` client.
  *
  * The whole thing runs in one transaction and is idempotent, so it is safe on every
  * start. It also reconciles in both directions: `models` is the complete desired
  * set, read against `information_schema.triggers`, so a table that carries the
  * trigger but is not listed has it dropped. Calling this with an empty or omitted
  * `models` therefore REMOVES every trigger of that name — it is not a no-op.
+ *
+ * Reconciliation is confined to the schemas `models` mentions, plus `schema`
+ * itself. A service that installs triggers per tenant schema can therefore
+ * reconcile one of them without tearing down the others.
  *
  * Two limits worth knowing. Postgres caps a notification payload at 8000 bytes and
  * raises an error beyond it, so a table with large rows can make its own writes
@@ -110,6 +143,7 @@ export async function installChangeTriggers(
         channel = CHANGE_NOTIFY_CHANNEL,
         triggerName = CHANGE_NOTIFY_TRIGGER_NAME,
         functionName = CHANGE_NOTIFY_FUNCTION_NAME,
+        schema = 'public',
         models = [],
         silent = true,
     }: ChangeTriggerConfig,
@@ -125,6 +159,7 @@ export async function installChangeTriggers(
                 PERFORM pg_notify(
                     TG_ARGV[0],
                     json_build_object(
+                        'schema', TG_TABLE_SCHEMA,
                         'table', TG_TABLE_NAME,
                         'op', TG_OP,
                         'row', row_to_json(rec)
@@ -135,31 +170,50 @@ export async function installChangeTriggers(
             $fn$ LANGUAGE plpgsql;
         `);
 
-            const rows = await tx.$queryRawUnsafe<{ table: string }[]>(
-                `SELECT event_object_table AS "table"
-               FROM information_schema.triggers
-              WHERE trigger_name = $1
-              GROUP BY event_object_table`,
-                triggerName,
-            );
-            const installed = new Set(rows.map(row => row.table));
-            const required = new Set(models);
+            const wanted = models.map(model => split(model, schema));
+            const schemas = [...new Set(wanted.map(one => one.schema))];
 
-            for (const model of models) {
-                if (!installed.has(model)) {
+            if (!schemas.includes(schema)) {
+                schemas.push(schema);
+            }
+
+            const rows = await tx.$queryRawUnsafe<
+                { schema: string; table: string }[]
+            >(
+                `SELECT event_object_schema AS "schema",
+                       event_object_table  AS "table"
+                  FROM information_schema.triggers
+                 WHERE trigger_name = $1
+                   AND event_object_schema = ANY ($2)
+                 GROUP BY event_object_schema, event_object_table`,
+                triggerName,
+                schemas,
+            );
+
+            const installed = new Set(
+                rows.map(row => qualify(row.schema, row.table)),
+            );
+            const required = new Set(
+                wanted.map(one => qualify(one.schema, one.table)),
+            );
+
+            for (const one of wanted) {
+                if (!installed.has(qualify(one.schema, one.table))) {
                     await tx.$executeRawUnsafe(
                         `CREATE TRIGGER "${triggerName}"
-                        AFTER INSERT OR UPDATE OR DELETE ON "${model}"
+                        AFTER INSERT OR UPDATE OR DELETE
+                        ON "${one.schema}"."${one.table}"
                         FOR EACH ROW
                         EXECUTE PROCEDURE ${functionName}('${channel}')`,
                     );
                 }
             }
 
-            for (const model of installed) {
-                if (!required.has(model)) {
+            for (const row of rows) {
+                if (!required.has(qualify(row.schema, row.table))) {
                     await tx.$executeRawUnsafe(
-                        `DROP TRIGGER IF EXISTS "${triggerName}" ON "${model}"`,
+                        `DROP TRIGGER IF EXISTS "${triggerName}"
+                         ON "${row.schema}"."${row.table}"`,
                     );
                 }
             }
