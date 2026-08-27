@@ -34,11 +34,15 @@ export const CHANGE_NOTIFY_FUNCTION_NAME = 'record_change_notify_fn';
  * Setting the trigger reads to decide whether to stay quiet.
  *
  * @remarks
- * A custom GUC rather than `session_replication_role`, which would also switch
- * off foreign-key enforcement — a bulk load run that way can leave orphan rows
- * behind. This suppresses nothing but these notifications.
+ * Named after the trigger it silences, like the channel, trigger and function
+ * above it — a reader meeting it in a `SET LOCAL` can tell what it belongs to
+ * without knowing this package.
+ *
+ * A setting of our own rather than `session_replication_role`, which would also
+ * switch off foreign-key enforcement — a bulk load run that way can leave orphan
+ * rows behind. This suppresses nothing but these notifications.
  */
-export const CHANGE_NOTIFY_SUPPRESS_SETTING = 'imq.notify_suppressed';
+export const CHANGE_NOTIFY_SUPPRESS_SETTING = 'record_change_notify.suppressed';
 
 /** Which tables notify, and under which Postgres object names. */
 export interface ChangeTriggerConfig {
