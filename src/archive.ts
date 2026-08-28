@@ -23,22 +23,20 @@
  */
 
 import { createHash } from 'node:crypto';
+import type { SqlExecutor } from './sql-client.js';
 import { silently } from './sql-log.js';
 
-/** The raw-SQL surface this installer needs (a Prisma client or its `tx`). */
-export interface ArchiveClient {
-    /**
-     * Execute a statement built by the installer.
-     *
-     * @remarks
-     * Named `Unsafe` because it interpolates rather than binds, which is what DDL
-     * requires — schema, table and column names cannot be parameters. Every
-     * identifier the installer interpolates is validated against
-     * `/^[A-Za-z_][A-Za-z0-9_]*$/` first, and it throws rather than quoting
-     * anything that fails.
-     */
-    $executeRawUnsafe(sql: string, ...values: unknown[]): Promise<unknown>;
-}
+/**
+ * The raw-SQL surface this installer needs.
+ *
+ * @remarks
+ * A `pg.Pool` satisfies it as it is. The DDL interpolates rather than binds,
+ * which is what DDL requires — schema, table and column names cannot be
+ * parameters. Every identifier interpolated here is validated against
+ * `/^[A-Za-z_][A-Za-z0-9_]*$/` first, and it throws rather than quoting
+ * anything that fails.
+ */
+export type ArchiveClient = SqlExecutor;
 
 /** One watched table to seed into the archive settings table. */
 export interface ArchivableModel {
@@ -54,7 +52,7 @@ export interface ArchivableModel {
 
 /** Everything {@link installArchiving} needs. */
 export interface InstallArchiveOptions {
-    /** The raw-SQL surface to install through — a Prisma client or a transaction. */
+    /** The raw-SQL surface to install through — a `pg.Pool`, or any executor. */
     client: ArchiveClient;
     /** Archive schema name (default `archive`). */
     archiveSchema?: string;
@@ -134,7 +132,7 @@ const lit = (value: string): string => value.replace(/'/g, "''");
  * @example
  * ```typescript
  * await installArchiving({
- *     client: prisma,
+ *     client: pool,
  *     models: [{ name: 'AuditLog', periodSeconds: 7 * 24 * 3600 }],
  * });
  * ```
@@ -161,12 +159,10 @@ export async function installArchiving(
         assertIdent(sourceSchema, 'source schema');
 
         // 1. archive schema
-        await client.$executeRawUnsafe(
-            `CREATE SCHEMA IF NOT EXISTS "${archiveSchema}"`,
-        );
+        await client.query(`CREATE SCHEMA IF NOT EXISTS "${archiveSchema}"`);
 
         // 2. settings table (+ `hash` column migration for pre-existing tables)
-        await client.$executeRawUnsafe(
+        await client.query(
             `CREATE TABLE IF NOT EXISTS "${archiveSchema}"."${settingsTable}" (
             "table"         text PRIMARY KEY,
             "sourceSchema"  text NOT NULL DEFAULT 'public',
@@ -176,7 +172,7 @@ export async function installArchiving(
             "hash"          text NOT NULL DEFAULT ''
         )`,
         );
-        await client.$executeRawUnsafe(
+        await client.query(
             `ALTER TABLE "${archiveSchema}"."${settingsTable}"
                 ADD COLUMN IF NOT EXISTS "hash" text NOT NULL DEFAULT ''`,
         );
@@ -194,7 +190,7 @@ export async function installArchiving(
             const hash = createHash('sha1')
                 .update([src, watchColumn, String(periodSeconds)].join('\0'))
                 .digest('hex');
-            await client.$executeRawUnsafe(
+            await client.query(
                 `INSERT INTO "${archiveSchema}"."${settingsTable}" AS cfg
                 ("table", "sourceSchema", "watchColumn", "periodSeconds", "hash")
              VALUES ($1, $2, $3, $4, $5)
@@ -204,18 +200,14 @@ export async function installArchiving(
                 "periodSeconds" = EXCLUDED."periodSeconds",
                 "hash"          = EXCLUDED."hash"
              WHERE cfg."hash" IS DISTINCT FROM EXCLUDED."hash"`,
-                t.name,
-                src,
-                watchColumn,
-                periodSeconds,
-                hash,
+                [t.name, src, watchColumn, periodSeconds, hash],
             );
         }
 
         // 4. sweep function — reads settings at call time, so operator edits take
         // effect without reinstalling. Aged rows are moved atomically per table via
         // DELETE ... RETURNING piped into the lazily-created archive copy.
-        await client.$executeRawUnsafe(
+        await client.query(
             `CREATE OR REPLACE FUNCTION "${archiveSchema}"."run"() RETURNS void AS $fn$
         DECLARE
             s record;
@@ -257,7 +249,7 @@ export async function installArchiving(
         );
 
         // 5. pg_cron (best-effort): create the extension if possible, then schedule.
-        await client.$executeRawUnsafe(
+        await client.query(
             `DO $do$
         BEGIN
             CREATE EXTENSION IF NOT EXISTS pg_cron;
@@ -269,7 +261,7 @@ export async function installArchiving(
         // Reconcile the schedule against pg_cron's own catalog: unschedule any
         // stale job that points at our run() (changed name or schedule), then
         // (re)create the desired one only if it isn't already present.
-        await client.$executeRawUnsafe(
+        await client.query(
             `DO $do$
         DECLARE
             j record;

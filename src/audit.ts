@@ -1,8 +1,8 @@
 /*!
- * Prisma audit-trail query extension
+ * Prisma Next (8.x) audit query middleware
  *
  * I'm Queue Software Project
- * Copyright (C) 2025  imqueue.com <support@imqueue.com>
+ * Copyright (C) 2026  imqueue.com <support@imqueue.com>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -22,248 +22,252 @@
  * <support@imqueue.com> to get commercial licensing options.
  */
 
-import { Prisma, type PrismaClient } from '@prisma/client/extension';
+import pg from 'pg';
+import type { SqlMiddleware } from '@prisma/orm-postgres/family-runtime';
+import type { AnyQueryAst } from '@prisma/orm-postgres/relational-core/ast';
+import type { StampTables } from './derive.js';
 
-/**
- * The three kinds of write recorded in the audit trail.
- *
- * @remarks
- * These are the literal strings written to the audit table's action column, so
- * they are part of the stored data, not just an internal enum — a reader querying
- * the trail matches on `'INSERT'`, `'UPDATE'` or `'DELETE'`.
- *
- * The mapping from Prisma operations is not one-to-one: `create` records `INSERT`,
- * `update` and `updateMany` record `UPDATE`, `delete` and `deleteMany` record
- * `DELETE`. A soft delete is recorded as `DELETE`, since it is the caller's
- * `delete` that is seen — but only when {@link audit} is added before
- * {@link softDelete}, because the reroute goes to the unextended client and
- * otherwise never reaches the audit extension at all.
- *
- * The value and the type share a name and a page, as the const-plus-derived-union
- * idiom requires.
- */
+/** The three write actions the trail records. */
 export const AuditAction = {
     INSERT: 'INSERT',
     UPDATE: 'UPDATE',
     DELETE: 'DELETE',
 } as const;
+
+/** One of the three {@link (AuditAction:variable) | AuditAction} values. */
 export type AuditAction = (typeof AuditAction)[keyof typeof AuditAction];
 
-/** A record's `id` — every audited model carries a surrogate `id` PK — or null. */
-function recordKey(rec: Record<string, unknown>): string | null {
-    return rec.id !== undefined && rec.id !== null ? String(rec.id) : null;
-}
-
 /**
- * Column names in the audit target table.
+ * Column names within the audit table.
  *
  * @remarks
- * Every name is required, because the rows are written with raw SQL that quotes
- * these identifiers directly — there is no Prisma model to fall back on. The code
- * generator emits this as `AUDIT_CONFIG`, so it normally comes from your schema
- * rather than being written by hand.
+ * Every one defaults to its own name, so a table whose columns are spelled the
+ * obvious way is configured by saying nothing. Name only what differs.
  */
 export interface AuditColumns {
     /** Column holding the JSON actor, as returned by `getPrincipal`. */
-    principal: string;
-    /**
-     * Column holding the action string.
-     *
-     * @remarks
-     * One of the three {@link (AuditAction:variable) | AuditAction} values. The member
-     * selector is required because the const and the type share the name, and an
-     * ambiguous `{@link}` renders as nothing at all rather than as an error.
-     */
-    action: string;
+    principal?: string;
+    /** Column holding the action string. */
+    action?: string;
     /** Column holding the name of the model that was written. */
-    model: string;
-    /** Column holding the affected record's `id`, or `'many'` for a bulk write. */
-    recordId: string;
-    /** Column holding the JSON payload: the record, or the args plus a count. */
-    changes: string;
+    modelName?: string;
+    /** Column holding the affected record's `id`. */
+    recordId?: string;
+    /** Column holding the JSON payload of the written row. */
+    changes?: string;
     /** Column stamped with the database's `now()` at insert time. */
-    createdAt: string;
+    createdAt?: string;
 }
 
-/** Where the audit trail is written, and under which column names. */
+/** Where the trail goes and what its columns are called. */
 export interface AuditConfig {
-    /**
-     * Table the trail is inserted into.
-     *
-     * @remarks
-     * Named `model` for symmetry with the rest of the config, but it is used as a
-     * raw table name — it need not be a Prisma model at all, which is the point of
-     * writing the trail with raw SQL.
-     */
-    model: string;
-    /** Column names within that table. */
-    columns: AuditColumns;
+    /** Table the trail is inserted into. Default `AuditLog`. */
+    table?: string;
+    /** Column names within that table, where they differ from the defaults. */
+    columns?: AuditColumns;
 }
 
-/** Everything {@link audit} needs to build its extension. */
+/** The table and columns an audit trail has unless it says otherwise. */
+const DEFAULTS = {
+    table: 'AuditLog',
+    columns: {
+        principal: 'principal',
+        action: 'action',
+        modelName: 'modelName',
+        recordId: 'recordId',
+        changes: 'changes',
+        createdAt: 'createdAt',
+    },
+} as const;
+
+/** Everything {@link audit} needs to build its middleware. */
 export interface AuditOptions {
     /**
-     * The UNEXTENDED Prisma client, used to write the audit rows.
+     * Connection string for the trail's own pool.
      *
      * @remarks
-     * Deliberately unextended: audit rows written through the extended client
-     * would themselves be audited.
+     * Deliberately a second connection rather than the client being audited:
+     * rows written through that client would themselves be audited, and the
+     * first write would not terminate.
      */
-    client: PrismaClient;
-    /** Where the trail goes and what its columns are called. */
-    config: AuditConfig;
-    /** Models whose writes are recorded to the audit log. */
-    models: ReadonlySet<string>;
-    /**
-     * Resolves the actor to record, or a falsy value to record none.
-     *
-     * @remarks
-     * Called per write and serialized with `JSON.stringify`, so it can return any
-     * shape you want stored. Resolving it lazily is what keeps this extension
-     * ignorant of where the actor comes from — a request context, an auth token,
-     * or nothing at all.
-     */
+    connectionString: string;
+    /** Where the trail goes. Omitted entirely, the defaults apply. */
+    config?: AuditConfig;
+    /** Physical table to model name, for the tables that are recorded. */
+    tables: Record<string, string>;
+    /** Soft-delete columns, so a stamped delete is recorded as a delete. */
+    stamps?: StampTables;
+    /** Resolves the actor to record, or a falsy value to record none. */
     getPrincipal: () => unknown;
 }
 
+interface Entry {
+    action: AuditAction;
+    model: string;
+    row: Record<string, unknown>;
+}
+
+interface Batch {
+    principal: string | null;
+    entries: Entry[];
+}
+
+interface Plan {
+    readonly ast?: AnyQueryAst;
+}
+
 /**
- * Build the query extension that records every write to an audited model.
+ * Build the middleware recording every write to the tables it is given.
  *
  * @remarks
- * Rows are inserted into `config.model` under the names in `config.columns`,
- * using raw SQL rather than a Prisma model — which is what lets the trail live in
- * a table Prisma knows nothing about. The row id is generated by Postgres
- * (`gen_random_uuid()`) because a Prisma-level `@default(uuid())` on the target is
- * client-side and never applies to a raw insert.
+ * Rows are captured as the database returns them, so the trail holds what was
+ * actually written — including values defaulted in SQL — and is inserted once
+ * the statement completes.
  *
- * What gets captured depends on the operation. `create`, `update` and `delete`
- * record the affected record itself, keyed by its `id`. `updateMany` and
- * `deleteMany` cannot identify rows, so they record the query args and the
- * affected count under the literal `recordId` of `'many'`. A model absent from
- * `models` is not recorded, and neither is a single-row write whose result has no
- * `id` — every audited model is assumed to carry a surrogate `id`.
+ * **Buffered per execution, not per client.** `onRow` is called from an async
+ * generator, so two concurrent statements on one client interleave at every
+ * row. A single shared buffer lets one statement's `afterQuery` flush the
+ * other's rows and stamp them with the wrong actor, which on a security trail
+ * is the worst failure available. Keying by the plan object confines each
+ * statement to its own rows, and a `WeakMap` drops the buffer of a statement
+ * that is never drained — an early `break`, or a `first()` — rather than
+ * leaking it into whatever flushes next.
  *
- * Auditing is fire-and-forget by design: the insert is not awaited, and a failure
- * is swallowed rather than thrown or logged. A write therefore never fails
- * because its audit row could not be stored — and equally, a broken audit
- * configuration is silent. Verify it once against a real table rather than
- * trusting that no error means it is working.
+ * The actor is resolved at the **first row**, inside the statement's own async
+ * context, for the same reason.
  *
- * Ordering matters when this is combined with an extension that reroutes an
- * operation to another client — {@link softDelete} turning a delete into an
- * update is exactly that. Prisma runs the first-added query hook outermost, so
- * `audit` must be added FIRST or the rerouted operation never reaches it and
- * vanishes from the trail.
+ * Call {@link close} when shutting down, or the pool keeps the process alive.
  *
- * @param input - The unextended client, the target config, the audited model
- *   names, and the actor resolver.
- * @returns A Prisma extension to pass to `client.$extends()`.
- * @example
- * ```typescript
- * const base = new PrismaClient();
- * const client = base
- *     .$extends(audit({
- *         client: base,
- *         config: AUDIT_CONFIG,
- *         models: new Set(['User']),
- *         getPrincipal: () => context.get()?.user ?? null,
- *     }))
- *     .$extends(softDelete({ client: base, models: SOFT_DELETE_MODELS }));
- * ```
+ * @param input - The trail's connection, table config, tables and actor.
+ * @returns Middleware with a `close()` for teardown.
  */
-export function audit({ client, config, models, getPrincipal }: AuditOptions) {
-    const { model: auditModel, columns: col } = config;
-    // INSERT INTO "<model>" ("id","action","model","recordId","principal","changes","createdAt")
-    //   VALUES (gen_random_uuid(), $1, $2, $3, $4::jsonb, $5::jsonb, now())
-    // The id is generated IN SQL: the target's Prisma-level `@default(uuid())`
-    // is client-side and never applies to a raw insert.
-    const sql =
-        `INSERT INTO "${auditModel}" ` +
-        `("id", "${col.action}", "${col.model}", "${col.recordId}", ` +
-        `"${col.principal}", "${col.changes}", "${col.createdAt}") ` +
-        `VALUES (gen_random_uuid(), $1, $2, $3, $4::jsonb, $5::jsonb, now())`;
+export function audit({
+    connectionString,
+    config = {},
+    tables,
+    stamps = {},
+    getPrincipal,
+}: AuditOptions): SqlMiddleware & { close(): Promise<void> } {
+    const pool = new pg.Pool({ connectionString });
+    const table = config.table ?? DEFAULTS.table;
+    const col = { ...DEFAULTS.columns, ...config.columns };
+    const pending = new WeakMap<object, Batch>();
 
-    function principalJson(): string | null {
-        const principal = getPrincipal();
+    const tableOf = (ast?: AnyQueryAst): string | undefined =>
+        ast?.kind === 'insert' ||
+        ast?.kind === 'update' ||
+        ast?.kind === 'delete'
+            ? ast.table.name
+            : undefined;
 
-        return principal ? JSON.stringify(principal) : null;
-    }
-
-    async function insert(
-        action: AuditAction,
-        model: string,
-        recordId: string,
-        changes: unknown,
-    ): Promise<void> {
-        await client.$executeRawUnsafe(
-            sql,
-            action,
-            model,
-            recordId,
-            principalJson(),
-            JSON.stringify(changes),
-        );
-    }
-
-    function auditAsync(
-        action: AuditAction,
-        model: string,
-        record: unknown,
-    ): void {
-        if (!models.has(model)) {
-            return;
+    const actionOf = (
+        ast: AnyQueryAst,
+        table: string,
+    ): AuditAction | undefined => {
+        if (ast.kind === 'insert') {
+            return AuditAction.INSERT;
         }
-        const rec = record as Record<string, unknown> | null;
-        const recordId = rec ? recordKey(rec) : null;
-        if (!rec || recordId === null) {
-            return;
+        if (ast.kind === 'delete') {
+            return AuditAction.DELETE;
         }
-        void insert(action, model, recordId, rec).catch(() => {});
-    }
-
-    function auditManyAsync(
-        action: AuditAction,
-        model: string,
-        args: unknown,
-        result: unknown,
-    ): void {
-        if (!models.has(model)) {
-            return;
+        if (ast.kind !== 'update') {
+            return undefined;
         }
-        const count = (result as { count?: number } | null)?.count ?? null;
-        void insert(action, model, 'many', { args, count }).catch(() => {});
-    }
+        // A soft delete reaches here as an update, because `stamp` rewrote it.
+        // Classifying on the assignment keeps DELETE reachable for exactly the
+        // models where a real DELETE never happens.
+        const column = stamps[table]?.deletedAt;
+        const assigned = column
+            ? (ast.set[column] as { value?: unknown } | undefined)
+            : undefined;
 
-    return Prisma.defineExtension({
+        return assigned !== undefined && assigned.value !== null
+            ? AuditAction.DELETE
+            : AuditAction.UPDATE;
+    };
+
+    return {
         name: 'audit',
-        query: {
-            $allModels: {
-                async create({ model, args, query }) {
-                    const result = await query(args);
-                    auditAsync(AuditAction.INSERT, model, result);
-                    return result;
-                },
-                async update({ model, args, query }) {
-                    const result = await query(args);
-                    auditAsync(AuditAction.UPDATE, model, result);
-                    return result;
-                },
-                async delete({ model, args, query }) {
-                    const result = await query(args);
-                    auditAsync(AuditAction.DELETE, model, result);
-                    return result;
-                },
-                async updateMany({ model, args, query }) {
-                    const result = await query(args);
-                    auditManyAsync(AuditAction.UPDATE, model, args, result);
-                    return result;
-                },
-                async deleteMany({ model, args, query }) {
-                    const result = await query(args);
-                    auditManyAsync(AuditAction.DELETE, model, args, result);
-                    return result;
-                },
-            },
+        familyId: 'sql' as const,
+        /** Ends the trail's pool. */
+        close: (): Promise<void> => pool.end(),
+        async onRow(row: Record<string, unknown>, plan: Plan): Promise<void> {
+            const ast = plan?.ast;
+            const table = tableOf(ast);
+            const model = table ? tables[table] : undefined;
+            if (
+                !ast ||
+                !table ||
+                !model ||
+                row.id === undefined ||
+                row.id === null
+            ) {
+                return;
+            }
+            const action = actionOf(ast, table);
+            if (!action) {
+                return;
+            }
+            const batch = pending.get(plan) ?? {
+                principal: (() => {
+                    const actor = getPrincipal();
+
+                    return actor ? JSON.stringify(actor) : null;
+                })(),
+                entries: [],
+            };
+            batch.entries.push({ action, model, row });
+            pending.set(plan, batch);
         },
-    });
+        async afterQuery(
+            plan: Plan,
+            result: { readonly completed?: boolean },
+            ctx: { readonly log?: { warn?: (m: string, f?: unknown) => void } },
+        ): Promise<void> {
+            const batch = pending.get(plan);
+            pending.delete(plan);
+            // A statement that threw still reaches here, with `completed`
+            // false. Recording those would put writes in the trail that the
+            // database rolled back.
+            if (
+                !batch ||
+                batch.entries.length === 0 ||
+                result?.completed === false
+            ) {
+                return;
+            }
+            const values = batch.entries
+                .map(
+                    (_entry, i) =>
+                        `(gen_random_uuid(), $${i * 4 + 1}, $${i * 4 + 2}, ` +
+                        `$${i * 4 + 3}, $${batch.entries.length * 4 + 1}::jsonb, ` +
+                        `$${i * 4 + 4}::jsonb, now())`,
+                )
+                .join(', ');
+            const params = batch.entries.flatMap(entry => [
+                entry.action,
+                entry.model,
+                String(entry.row.id),
+                JSON.stringify(entry.row),
+            ]);
+            await pool
+                .query(
+                    `INSERT INTO "${table}" ("id", "${col.action}", ` +
+                        `"${col.modelName}", "${col.recordId}", "${col.principal}", ` +
+                        `"${col.changes}", "${col.createdAt}") VALUES ${values}`,
+                    [...params, batch.principal],
+                )
+                .then(
+                    () => undefined,
+                    // An audit that cannot be written must not fail the write
+                    // it was recording — but a trail that silently stops is
+                    // worse than one that is noisy about stopping.
+                    (error: unknown) => {
+                        ctx?.log?.warn?.('audit trail insert failed', {
+                            error,
+                        });
+                    },
+                );
+        },
+    };
 }

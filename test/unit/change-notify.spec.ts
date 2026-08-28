@@ -35,24 +35,25 @@ interface Installed {
     table: string;
 }
 
+/** A fake pool of the shape a `pg.Pool` presents, recording what it is given. */
 function client(installed: Installed[] = []) {
     const statements: string[] = [];
     const queries: { sql: string; values: unknown[] }[] = [];
 
     const executor = {
-        $executeRawUnsafe: async (sql: string) => {
+        query: async (sql: string, values: readonly unknown[] = []) => {
             statements.push(sql.replace(/\s+/g, ' ').trim());
-
-            return 0;
-        },
-        $queryRawUnsafe: async <T>(sql: string, ...values: unknown[]) => {
-            queries.push({ sql, values });
+            // Only the parameterised reads are of interest to the assertions;
+            // recording the DDL here too would renumber every index.
+            if (values.length > 0) {
+                queries.push({ sql, values: [...values] });
+            }
 
             const schemas = (values[1] ?? []) as string[];
 
-            return installed.filter(one =>
-                schemas.includes(one.schema),
-            ) as unknown as T;
+            return {
+                rows: installed.filter(one => schemas.includes(one.schema)),
+            };
         },
     };
 
@@ -60,8 +61,7 @@ function client(installed: Installed[] = []) {
         statements,
         queries,
         ...executor,
-        $transaction: async <T>(fn: (tx: typeof executor) => Promise<T>) =>
-            fn(executor),
+        connect: async () => ({ ...executor, release: () => undefined }),
     };
 }
 
@@ -159,15 +159,19 @@ describe('withoutChangeNotify()', () => {
         const db = client();
 
         await withoutChangeNotify(db, async tx => {
-            await tx.$executeRawUnsafe('INSERT INTO "Term" VALUES (1)');
+            await tx.query('INSERT INTO "Term" VALUES (1)');
         });
 
-        assert.equal(
-            db.statements[0],
-            `SET LOCAL "${CHANGE_NOTIFY_SUPPRESS_SETTING}" = 'on'`,
+        assert.deepEqual(
+            db.statements.slice(0, 3),
+            [
+                'BEGIN',
+                `SET LOCAL "${CHANGE_NOTIFY_SUPPRESS_SETTING}" = 'on'`,
+                'INSERT INTO "Term" VALUES (1)',
+            ],
             'the setting is LOCAL, so it reverts with the transaction',
         );
-        assert.match(db.statements[1] ?? '', /INSERT INTO "Term"/);
+        assert.equal(db.statements.at(-1), 'COMMIT');
     });
 
     it('hands the transaction to the caller, not the outer client', async () => {
@@ -192,7 +196,7 @@ describe('withoutChangeNotify()', () => {
 
         await withoutChangeNotify(db, async () => undefined, 'app.quiet');
 
-        assert.equal(db.statements[0], `SET LOCAL "app.quiet" = 'on'`);
+        assert.equal(db.statements[1], `SET LOCAL "app.quiet" = 'on'`);
     });
 });
 
