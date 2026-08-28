@@ -38,19 +38,44 @@ const EXPORTS = [
     'CHANGE_NOTIFY_FUNCTION_NAME',
     'CHANGE_NOTIFY_SUPPRESS_SETTING',
     'CHANGE_NOTIFY_TRIGGER_NAME',
+    'EMPTY',
+    'RUNTIME',
+    'TIMESTAMP_CODECS',
     'accessScope',
-    'accessWhere',
     'audit',
-    'authorship',
+    'dataLayer',
+    'dataPool',
+    'deriveDataLayer',
+    'emitAll',
+    'emitEnums',
+    'emitImports',
+    'emitModels',
+    'emitRpcTypes',
+    'hasDatabaseDefault',
     'installArchiving',
     'installChangeTriggers',
     'isSqlLogSuppressed',
     'isoDates',
-    'migrateDown',
+    'join',
+    'namespaceOf',
+    'parseImportMap',
     'prettifySql',
+    'queryLog',
+    'quoted',
+    'raw',
+    'repositoriesFor',
+    'scopePredicate',
     'silently',
-    'softDelete',
-    'toIsoDates',
+    'sql',
+    'sqlRunner',
+    'stamp',
+    'toOrdering',
+    'toPredicate',
+    'toProjection',
+    'toQuery',
+    'transactionFor',
+    'typeOf',
+    'withTransaction',
     'withoutChangeNotify',
 ];
 
@@ -59,14 +84,15 @@ const EXPORTS = [
 // with ERR_REQUIRE_ASYNC_MODULE. Two things put an async module in this graph and
 // so broke every CJS consumer of the package:
 //
-//   * `export * from './codegen.js'` in src/index.ts, which exported nothing at
-//     all (every `export` in codegen.ts is inside a generated-code template
-//     string) while pulling in its top-level `await import(...)`;
+//   * `export * from './codegen.js'` in src/index.ts, which pulled in a
+//     top-level `await import(...)`;
 //   * `await cli()` at the foot of src/migrate-down.ts.
 //
-// Neither is visible from inside ESM, which is why it went unnoticed. Run in a
-// child process because `require` of an async graph poisons nothing but is
-// simplest to assert on its own.
+// Both modules are gone on Prisma Next — the contract emitter replaced the
+// generator and the migration graph replaced the down-migration CLI — so
+// neither cause can recur. The guard stays because the failure is invisible
+// from inside ESM, and the next module to add a top-level await would
+// reintroduce it silently.
 test('the package barrel is require()-able from CommonJS', () => {
     const out = execFileSync(
         process.execPath,
@@ -101,28 +127,4 @@ test('the barrel exports the same names to ESM and CommonJS', async () => {
     ).sort();
 
     assert.deepEqual(cjs, esm);
-});
-
-// migrate-down.ts doubles as a CLI. Rejections used to surface through a
-// top-level await; they now go through an explicit .catch(), so pin the contract
-// that replaced it — a message on stderr and a non-zero exit.
-test('the migrate-down CLI still fails with exit code 1', () => {
-    let status: number | null = null;
-    let stderr = '';
-
-    try {
-        execFileSync(
-            process.execPath,
-            [join(ROOT, 'src', 'migrate-down.js'), '--nope'],
-            { encoding: 'utf8', stdio: 'pipe' },
-        );
-    } catch (error) {
-        const failure = error as { status?: number; stderr?: string };
-
-        status = failure.status ?? null;
-        stderr = failure.stderr ?? '';
-    }
-
-    assert.equal(status, 1);
-    assert.match(stderr, /Unknown argument: --nope/);
 });

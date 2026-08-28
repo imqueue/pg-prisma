@@ -21,9 +21,10 @@
  * purchase a proprietary commercial license. Please contact us at
  * <support@imqueue.com> to get commercial licensing options.
  */
+
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { accessWhere, type AccessScopeResolver } from '../../index.js';
+import { type AccessScopeResolver, scopePredicate } from '../../index.js';
 
 /** Build a resolvers map from plain values (a value → a `() => value` getter). */
 const resolvers = (
@@ -31,173 +32,118 @@ const resolvers = (
 ): Record<string, AccessScopeResolver> =>
     Object.fromEntries(Object.entries(map).map(([k, v]) => [k, () => v]));
 
-test('an unscoped model passes its where through untouched', () => {
-    const where = { name: 'x' };
-    assert.equal(accessWhere(where, undefined, resolvers({})), where);
+/**
+ * Reduce a predicate to the shape these tests are about.
+ *
+ * @remarks
+ * Comparing the AST nodes directly would assert the runtime's internals rather
+ * than this package's composition, and would break on any upstream field it
+ * adds. What matters here is the operator tree and the columns it touches.
+ */
+const shape = (node: unknown): unknown => {
+    const n = node as {
+        kind?: string;
+        exprs?: unknown[];
+        op?: string;
+        left?: { column?: string };
+        right?: {
+            kind?: string;
+            values?: { value?: unknown }[];
+            value?: unknown;
+        };
+    };
+    if (n?.kind === 'and' || n?.kind === 'or') {
+        return { [n.kind]: (n.exprs ?? []).map(shape) };
+    }
+    if (n?.kind === 'binary') {
+        const right =
+            n.right?.kind === 'list'
+                ? (n.right.values ?? []).map(v => v.value)
+                : n.right?.value;
+
+        return { [`${n.left?.column} ${n.op}`]: right };
+    }
+
+    return n?.kind ?? n;
+};
+
+test('an unscoped model yields no predicate', () => {
+    assert.equal(scopePredicate('t', undefined, resolvers({})), null);
 });
 
-test('a single scalar column becomes an OR-of-one equals, AND-ed on', () => {
-    const out = accessWhere(
-        undefined,
+test('a single scalar column becomes an OR-of-one equality', () => {
+    const out = scopePredicate(
+        't',
         { user: ['createdBy'] },
         resolvers({ user: 'u1' }),
     );
-    assert.deepEqual(out, { AND: [{ OR: [{ createdBy: 'u1' }] }] });
+    assert.deepEqual(shape(out), { or: [{ 'createdBy eq': 'u1' }] });
 });
 
 test('several columns for one level are OR-ed (union)', () => {
-    const out = accessWhere(
-        undefined,
+    const out = scopePredicate(
+        't',
         { user: ['createdBy', 'id'] },
         resolvers({ user: 'u1' }),
     );
-    assert.deepEqual(out, {
-        AND: [{ OR: [{ createdBy: 'u1' }, { id: 'u1' }] }],
+    assert.deepEqual(shape(out), {
+        or: [{ 'createdBy eq': 'u1' }, { 'id eq': 'u1' }],
     });
 });
 
 test('an array value becomes an IN filter', () => {
-    const out = accessWhere(
-        undefined,
+    const out = scopePredicate(
+        't',
         { portfolio: ['portfolioId'] },
         resolvers({ portfolio: ['p1', 'p2'] }),
     );
-    assert.deepEqual(out, {
-        AND: [{ OR: [{ portfolioId: { in: ['p1', 'p2'] } }] }],
-    });
+    assert.deepEqual(shape(out), { or: [{ 'portfolioId in': ['p1', 'p2'] }] });
 });
 
 test('active levels are AND-ed together; each is its own OR group', () => {
-    const out = accessWhere(
-        undefined,
+    const out = scopePredicate(
+        't',
         { user: ['createdBy', 'id'], portfolio: ['portfolioId'] },
         resolvers({ user: 'u1', portfolio: ['p1'] }),
     );
-    assert.deepEqual(out, {
-        AND: [
-            { OR: [{ createdBy: 'u1' }, { id: 'u1' }] },
-            { OR: [{ portfolioId: { in: ['p1'] } }] },
+    assert.deepEqual(shape(out), {
+        and: [
+            { or: [{ 'createdBy eq': 'u1' }, { 'id eq': 'u1' }] },
+            { or: [{ 'portfolioId in': ['p1'] }] },
         ],
     });
 });
 
 test('an undefined resolver value leaves that level inactive', () => {
-    const out = accessWhere(
-        undefined,
+    const out = scopePredicate(
+        't',
         { user: ['createdBy'], portfolio: ['portfolioId'] },
         resolvers({ user: 'u1', portfolio: undefined }),
     );
-    // Only the user level constrains; portfolio is skipped entirely.
-    assert.deepEqual(out, { AND: [{ OR: [{ createdBy: 'u1' }] }] });
+    assert.deepEqual(shape(out), { or: [{ 'createdBy eq': 'u1' }] });
 });
 
-test('all levels inactive returns the where unchanged', () => {
-    const where = { active: true };
-    const out = accessWhere(
-        where,
+test('all levels inactive yields no predicate', () => {
+    const out = scopePredicate(
+        't',
         { user: ['createdBy'] },
         resolvers({ user: undefined }),
     );
-    assert.equal(out, where);
+    assert.equal(out, null);
 });
 
 test('a null value denies via an impossible IN ()', () => {
-    const out = accessWhere(
-        undefined,
+    const out = scopePredicate(
+        't',
         { user: ['createdBy', 'id'] },
         resolvers({ user: null }),
     );
-    assert.deepEqual(out, {
-        AND: [{ OR: [{ createdBy: { in: [] } }, { id: { in: [] } }] }],
+    assert.deepEqual(shape(out), {
+        or: [{ 'createdBy in': [] }, { 'id in': [] }],
     });
 });
 
-test('an empty array also denies (IN of nothing)', () => {
-    const out = accessWhere(
-        undefined,
-        { portfolio: ['portfolioId'] },
-        resolvers({ portfolio: [] }),
-    );
-    assert.deepEqual(out, {
-        AND: [{ OR: [{ portfolioId: { in: [] } }] }],
-    });
-});
-
-test('the caller where is preserved and AND-ed, never replaced', () => {
-    const out = accessWhere(
-        { active: true },
-        { user: ['createdBy'] },
-        resolvers({ user: 'u1' }),
-    );
-    assert.deepEqual(out, {
-        active: true,
-        AND: [{ OR: [{ createdBy: 'u1' }] }],
-    });
-});
-
-test('a missing resolver for a configured level is skipped', () => {
-    const out = accessWhere(
-        undefined,
-        { user: ['createdBy'], portfolio: ['portfolioId'] },
-        resolvers({ user: 'u1' }), // no `portfolio` resolver at all
-    );
-    assert.deepEqual(out, { AND: [{ OR: [{ createdBy: 'u1' }] }] });
-});
-
-/*
- * The regression the rest of this file exists for.
- *
- * `update`, `delete` and `findUnique` take a `WhereUniqueInput`, and Prisma
- * requires a unique field at its *top level*. Nesting the caller's `where`
- * inside `AND` — which this did — left the argument with no unique field, so
- * Prisma refused the call instead of scoping it, and every scoped update in
- * every service using this extension failed.
- */
-test('a unique field stays at the top level, where update needs it', () => {
-    const out = accessWhere(
-        { id: 'r1' },
-        { portfolio: ['portfolioId'] },
-        resolvers({ portfolio: ['p1'] }),
-    );
-    assert.deepEqual(out, {
-        id: 'r1',
-        AND: [{ OR: [{ portfolioId: { in: ['p1'] } }] }],
-    });
-});
-
-test("the caller's own AND is conjoined rather than overwritten", () => {
-    const out = accessWhere(
-        { id: 'r1', AND: [{ active: true }] },
-        { portfolio: ['portfolioId'] },
-        resolvers({ portfolio: ['p1'] }),
-    );
-    assert.deepEqual(out, {
-        id: 'r1',
-        AND: [{ active: true }, { OR: [{ portfolioId: { in: ['p1'] } }] }],
-    });
-});
-
-test('a single-object AND from the caller is conjoined too', () => {
-    const out = accessWhere(
-        { id: 'r1', AND: { active: true } },
-        { portfolio: ['portfolioId'] },
-        resolvers({ portfolio: ['p1'] }),
-    );
-    assert.deepEqual(out, {
-        id: 'r1',
-        AND: [{ active: true }, { OR: [{ portfolioId: { in: ['p1'] } }] }],
-    });
-});
-
-test('a caller condition on a scope column is kept, so it cannot widen', () => {
-    const out = accessWhere(
-        { portfolioId: 'p9' },
-        { portfolio: ['portfolioId'] },
-        resolvers({ portfolio: ['p1'] }),
-    );
-    // Both conditions apply: asking for p9 under a p1 scope matches nothing.
-    assert.deepEqual(out, {
-        portfolioId: 'p9',
-        AND: [{ OR: [{ portfolioId: { in: ['p1'] } }] }],
-    });
+test('a level named in the config but with no resolver is skipped', () => {
+    const out = scopePredicate('t', { user: ['createdBy'] }, resolvers({}));
+    assert.equal(out, null);
 });

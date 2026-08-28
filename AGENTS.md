@@ -9,12 +9,13 @@ making changes. For contribution *process/terms* see
 
 ## What this is
 
-`@imqueue/pg-prisma` is the Prisma/Postgres persistence toolkit of the @imqueue
-framework. It provides Prisma client extensions, Postgres operational helpers,
-and a Prisma generator that emits typed
-[`@imqueue/rpc`](https://github.com/imqueue/rpc) model & repository classes.
-The generated model classes validate their inputs with
-[`@imqueue/validation`](https://github.com/imqueue/validation).
+`@imqueue/pg-prisma` is the Prisma Next (8.x) / Postgres persistence toolkit of
+the @imqueue framework. It provides query middlewares that rewrite a statement
+before it is lowered to SQL, and Postgres operational helpers.
+
+There is no code generator. Prisma Next emits `contract.json`, and
+`deriveDataLayer` reads the per-model configuration straight out of it, so
+nothing is written to disk and nothing can drift from the schema.
 
 ## Toolchain & invariants (do not fight these)
 
@@ -24,15 +25,16 @@ The generated model classes validate their inputs with
 - **TypeScript, `module`/`moduleResolution: nodenext`**, `target: es2024`,
   `verbatimModuleSyntax: true`, `isolatedModules: true`, `strict: true`. Use
   `import type` / `import { type X }` for type-only imports.
-- **Node ≥ 22.12. Prisma 7+.**
-- **`@prisma/client` is a peer dependency.** The extension modules import the
-  `Prisma` namespace / `PrismaClient` type from **`@prisma/client/extension`** —
-  the official entry for *shareable* Client extensions. It resolves without
-  running `prisma generate` and works no matter where the consumer generates
-  their client (default `@prisma/client` output or a custom output path), so
-  this package needs no schema or generated client of its own to build. Runtime
-  deps are kept minimal: `pg` (down-migrations) and `@prisma/generator-helper`
-  (the generator). Do not add heavyweight deps.
+- **Node ≥ 22.12. Prisma Next (8.x).**
+- **`@prisma/orm-postgres` is a peer dependency.** The middlewares import AST
+  constructors and types from **`@prisma/orm-postgres/relational-core/ast`**.
+  That subpath resolves without emitting a contract, so this package needs no
+  schema of its own to build. The single runtime dep is `pg`, for the audit
+  trail's own pool. Do not add heavyweight deps.
+- **Use the real AST types.** `AnyQueryAst` is a discriminated union on `kind`;
+  narrowing on it gives `table`, `set`, `rows` and `returning` their proper
+  types. A hand-rolled structural type here costs the one check that catches a
+  mistake.
 - **Lint/format:** `oxlint` + `oxfmt`. Run `npm run format` before committing;
   CI checks `npm run format:check`.
 - Build **emits `.js`/`.d.ts`/`.js.map` next to sources**; these are
@@ -53,10 +55,11 @@ npm run test-coverage  # tests + experimental coverage summary
 npm run test-lcov      # writes coverage/lcov.info
 ```
 
-Unit tests (`test/**/*.spec.ts`, run compiled) cover the pure helpers
-(`prettifySql`, `accessWhere`). The extension and installer modules that touch a
-live database are exercised by the consuming service's integration suite, not
-here.
+Unit tests (`test/**/*.spec.ts`, run compiled) cover the middlewares by
+constructing AST nodes directly — no database is needed to assert what a
+statement was rewritten into, and that is where the bugs have been. The
+installer modules that touch a live database are exercised by the consuming
+service's integration suite, not here.
 
 ## Layout
 
@@ -64,16 +67,16 @@ here.
 |---|---|
 | `index.ts` | Public entry: `export * from './src/index.js'` |
 | `src/index.ts` | Barrel re-exporting the public API |
-| `src/soft-delete.ts` | Prisma soft-delete query extension. |
-| `src/audit.ts` | Prisma audit-trail query extension. |
-| `src/authorship.ts` | Prisma authorship-stamping query extension. |
-| `src/access-scope.ts` | `accessWhere()` row-level access-scope filter composer. |
+| `src/ast.ts` | AST helpers; `filterSelects()` walks every select in a statement. |
+| `src/derive.ts` | `deriveDataLayer()` — per-table config read from `contract.json`. |
+| `src/data-layer.ts` | `dataLayer()` — the composed middleware array, in one call. |
+| `src/stamp.ts` | Soft-delete and authorship, as one middleware. |
+| `src/access-scope.ts` | Row-level access-scope middleware. |
+| `src/audit.ts` | Audit-trail middleware, writing through its own pool. |
 | `src/archive.ts` | Row-archiving installer (aged rows → mirror `archive` schema, pg_cron). |
 | `src/change-notify.ts` | Postgres row-change `NOTIFY` trigger installer. |
-| `src/migrate-down.ts` | `migrateDown()` — undo applied Prisma migrations; also a CLI. |
 | `src/pretty-sql.ts` | `prettifySql()` SQL pretty-printer for query logging. |
 | `src/sql-log.ts` | Cooperative SQL-log suppression (`silently`, `isSqlLogSuppressed`). |
-| `src/codegen.ts` | Prisma generator: emits typed `@imqueue/rpc` models & repositories. |
 | `test/**` | `node:test` specs (`*.spec.ts`). |
 
 ## Behavioural invariants
@@ -87,10 +90,18 @@ here.
   `#prisma`, RPC decorators from `@imqueue/rpc`, and validation decorators from
   `@imqueue/validation`. Keep those import strings stable — they are the
   generator's output contract.
-- **`migrateDown()` is side-effect-pure at import time.** The generator and the
-  migrate-down CLI only run when their module is executed directly
-  (`import.meta.url === argv[1]`); importing the package barrel must have no side
-  effects and must not require the dev-only `@prisma/generator-helper`.
+- **Filter the whole statement, never just its root.** Prisma Next compiles a
+  relation read into one statement holding several selects. A predicate applied
+  only to the outermost `from` returns the rows it was meant to exclude,
+  through any `include`, with nothing logged. Use `filterSelects()`.
+- **Qualify a column by the source's alias when it has one.** `TableSource`
+  renders as `"public"."Session" AS "s"`, and a column qualified by the table
+  name is then not in scope; Postgres rejects the statement.
+- **Buffer audit rows per execution, not per client.** `onRow` runs inside an
+  async generator, so concurrent statements on one client interleave at every
+  row. A shared buffer lets one statement flush another's rows under the wrong
+  actor — the worst failure a security trail has. Key by the plan object, and
+  resolve the actor at the first row, inside that statement's async context.
 - **`silently()` flips a shared module flag** — it is for pre-request one-offs
   (startup DDL), not interleaved concurrent traffic.
 

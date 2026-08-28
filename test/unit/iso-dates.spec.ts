@@ -1,5 +1,5 @@
 /*!
- * toIsoDates() unit tests
+ * @imqueue/pg-prisma — ISO date conversion tests
  *
  * I'm Queue Software Project
  * Copyright (C) 2025  imqueue.com <support@imqueue.com>
@@ -21,75 +21,94 @@
  * purchase a proprietary commercial license. Please contact us at
  * <support@imqueue.com> to get commercial licensing options.
  */
+
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { toIsoDates } from '../../index.js';
+import { isoDates } from '../../index.js';
 
-test('a date becomes its ISO string', () => {
-    assert.equal(
-        toIsoDates(new Date('2026-08-16T11:35:59.323Z')),
-        '2026-08-16T11:35:59.323Z',
+const middleware = isoDates({ columns: new Set(['createdAt', 'expiresAt']) });
+const convert = async (row: object): Promise<object> => {
+    await middleware.onRow?.(
+        row as Record<string, unknown>,
+        undefined as never,
+        undefined as never,
     );
-});
 
-test('a date nested in a row is replaced where it sits', () => {
+    return row;
+};
+
+test('an offset timestamp becomes a canonical UTC instant', async () => {
     assert.deepEqual(
-        toIsoDates({ id: 'a', at: new Date('2026-01-02T03:04:05.000Z') }),
-        { id: 'a', at: '2026-01-02T03:04:05.000Z' },
+        await convert({ createdAt: '2026-08-14 09:30:00.123+00' }),
+        {
+            createdAt: '2026-08-14T09:30:00.123Z',
+        },
     );
 });
 
-test('an array of rows keeps its order and its shape', () => {
+// Postgres prints `09:30:00.500` as `09:30:00.5` and a whole second with no
+// fraction at all, so the width varies with the value. Every boundary
+// downstream wants three digits, and a lexicographic comparison of two such
+// strings wants them too.
+test('a trimmed fraction is padded back to milliseconds', async () => {
     assert.deepEqual(
-        toIsoDates([{ at: new Date(0) }, { at: new Date(1000) }]),
-        [
-            { at: '1970-01-01T00:00:00.000Z' },
-            { at: '1970-01-01T00:00:01.000Z' },
-        ],
+        await convert({
+            createdAt: '2026-08-14 09:30:00.5+00',
+            expiresAt: '2026-08-14 09:30:00+00',
+        }),
+        {
+            createdAt: '2026-08-14T09:30:00.500Z',
+            expiresAt: '2026-08-14T09:30:00.000Z',
+        },
     );
 });
 
-/*
- * The regression. Walking an object with `Object.entries` turns a buffer into
- * `{ "0": 137, "1": 80, … }` — one key per byte, roughly fifty times the size,
- * and no longer something `Buffer.isBuffer` recognises. A `Bytes` column read
- * through this extension arrived unusable, and the failure looked like the row
- * not existing at all.
- */
-test('a buffer comes back as the same buffer', () => {
-    const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
-    const out = toIsoDates(bytes);
-
-    assert.equal(out, bytes);
-    assert.ok(Buffer.isBuffer(out));
+// The value is the same instant whichever zone the server prints it in, so
+// the conversion has to do the arithmetic rather than swap the suffix.
+test('a non-UTC offset is normalised to UTC', async () => {
+    assert.deepEqual(
+        await convert({ createdAt: '2026-08-14 11:30:00.123+02' }),
+        {
+            createdAt: '2026-08-14T09:30:00.123Z',
+        },
+    );
 });
 
-test('a buffer inside a row survives the walk', () => {
-    const bytes = Buffer.from('a logo, more or less');
-    const row = toIsoDates({
-        name: 'mark.svg',
-        data: bytes,
-        at: new Date('2026-08-16T00:00:00.000Z'),
-    }) as { name: string; data: unknown; at: string };
-
-    assert.ok(Buffer.isBuffer(row.data));
-    assert.equal(row.data, bytes);
-    assert.equal(row.at, '2026-08-16T00:00:00.000Z');
+// The column type this fallback exists for: without the `Z`, `new Date` reads
+// the value as local time and every instant shifts by the host's offset.
+test('a timestamp with no zone is read as UTC, not as local time', async () => {
+    assert.deepEqual(await convert({ createdAt: '2026-08-14 09:30:00.123' }), {
+        createdAt: '2026-08-14T09:30:00.123Z',
+    });
 });
 
-test('every typed array is left alone, not only Buffer', () => {
-    for (const view of [
-        new Uint8Array([1, 2]),
-        new Int16Array([3]),
-        new Float64Array([4.5]),
-        new DataView(new ArrayBuffer(2)),
-    ]) {
-        assert.equal(toIsoDates(view), view, view.constructor.name);
-    }
+test('an included relation is converted too', async () => {
+    assert.deepEqual(
+        await convert({
+            createdAt: '2026-08-14 09:30:00+00',
+            sessions: [{ expiresAt: '2026-08-14 10:00:00+00' }],
+        }),
+        {
+            createdAt: '2026-08-14T09:30:00.000Z',
+            sessions: [{ expiresAt: '2026-08-14T10:00:00.000Z' }],
+        },
+    );
 });
 
-test('a bare ArrayBuffer is left alone too', () => {
-    const buffer = new ArrayBuffer(4);
+test('a column that is not a date column is left alone', async () => {
+    assert.deepEqual(await convert({ note: '2026-08-14 09:30:00+00' }), {
+        note: '2026-08-14 09:30:00+00',
+    });
+});
 
-    assert.equal(toIsoDates(buffer), buffer);
+// The name matching alone is not enough: a text column named like a date one
+// holds whatever a caller put in it.
+test('a date column holding something else is left alone', async () => {
+    assert.deepEqual(await convert({ createdAt: 'yesterday' }), {
+        createdAt: 'yesterday',
+    });
+});
+
+test('a null date is left alone', async () => {
+    assert.deepEqual(await convert({ createdAt: null }), { createdAt: null });
 });

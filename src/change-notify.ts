@@ -22,6 +22,8 @@
  * <support@imqueue.com> to get commercial licensing options.
  */
 
+import type { SqlExecutor, SqlPool } from './sql-client.js';
+import { withTransaction } from './sql-client.js';
 import { silently } from './sql-log.js';
 
 /** Default Postgres NOTIFY channel the change triggers emit on. */
@@ -84,25 +86,17 @@ export interface ChangeTriggerConfig {
     silent?: boolean;
 }
 
-/** The raw-SQL surface used to install triggers (a Prisma client or its `tx`). */
-export interface RawExecutor {
-    /** Execute a statement — used for the DDL, which cannot use bind parameters. */
-    $executeRawUnsafe(sql: string, ...values: unknown[]): Promise<unknown>;
-    /** Run a query — used to read the currently installed triggers back. */
-    $queryRawUnsafe<T>(sql: string, ...values: unknown[]): Promise<T>;
-}
+/** The raw-SQL surface used to install triggers. A `pg.Pool` satisfies it. */
+export type RawExecutor = SqlExecutor;
 
-/** A {@link RawExecutor} that can also open a transaction. */
-export interface RawClient extends RawExecutor {
-    /**
-     * Run `fn` inside a transaction.
-     *
-     * @remarks
-     * {@link installChangeTriggers} needs this so the whole reconciliation — the
-     * function, the added triggers and the dropped ones — either lands or does not.
-     */
-    $transaction<T>(fn: (tx: RawExecutor) => Promise<T>): Promise<T>;
-}
+/**
+ * A {@link RawExecutor} that can also open a transaction.
+ *
+ * @remarks
+ * {@link installChangeTriggers} needs one so the whole reconciliation — the
+ * function, the added triggers and the dropped ones — either lands or does not.
+ */
+export type RawClient = SqlPool;
 
 /** A model name as `schema` and `table`, taking `fallback` when unqualified. */
 function split(
@@ -152,7 +146,7 @@ const qualify = (schema: string, table: string): string => `${schema}.${table}`;
  * @returns Nothing; it resolves once the triggers match `models`.
  * @example
  * ```typescript
- * await installChangeTriggers(prisma, { models: ['User', 'Order'] });
+ * await installChangeTriggers(pool, { models: ['User', 'Order'] });
  * ```
  */
 export async function installChangeTriggers(
@@ -168,8 +162,8 @@ export async function installChangeTriggers(
     }: ChangeTriggerConfig,
 ): Promise<void> {
     const install = (): Promise<unknown> =>
-        client.$transaction(async tx => {
-            await tx.$executeRawUnsafe(`
+        withTransaction(client, async tx => {
+            await tx.query(`
             CREATE OR REPLACE FUNCTION ${functionName}() RETURNS trigger AS $fn$
             DECLARE
                 rec record;
@@ -201,18 +195,17 @@ export async function installChangeTriggers(
                 schemas.push(schema);
             }
 
-            const rows = await tx.$queryRawUnsafe<
-                { schema: string; table: string }[]
-            >(
-                `SELECT event_object_schema AS "schema",
+            const rows = (
+                await tx.query(
+                    `SELECT event_object_schema AS "schema",
                        event_object_table  AS "table"
                   FROM information_schema.triggers
                  WHERE trigger_name = $1
                    AND event_object_schema = ANY ($2)
                  GROUP BY event_object_schema, event_object_table`,
-                triggerName,
-                schemas,
-            );
+                    [triggerName, schemas],
+                )
+            ).rows as { schema: string; table: string }[];
 
             const installed = new Set(
                 rows.map(row => qualify(row.schema, row.table)),
@@ -223,7 +216,7 @@ export async function installChangeTriggers(
 
             for (const one of wanted) {
                 if (!installed.has(qualify(one.schema, one.table))) {
-                    await tx.$executeRawUnsafe(
+                    await tx.query(
                         `CREATE TRIGGER "${triggerName}"
                         AFTER INSERT OR UPDATE OR DELETE
                         ON "${one.schema}"."${one.table}"
@@ -235,7 +228,7 @@ export async function installChangeTriggers(
 
             for (const row of rows) {
                 if (!required.has(qualify(row.schema, row.table))) {
-                    await tx.$executeRawUnsafe(
+                    await tx.query(
                         `DROP TRIGGER IF EXISTS "${triggerName}"
                          ON "${row.schema}"."${row.table}"`,
                     );
@@ -276,8 +269,8 @@ export async function installChangeTriggers(
  * @returns Whatever `fn` resolves to.
  * @example
  * ```typescript
- * await withoutChangeNotify(prisma, async tx => {
- *     await tx.$executeRawUnsafe(bulkUpsert);
+ * await withoutChangeNotify(pool, async tx => {
+ *     await tx.query(bulkUpsert);
  * });
  * ```
  */
@@ -286,8 +279,8 @@ export async function withoutChangeNotify<T>(
     fn: (tx: RawExecutor) => Promise<T>,
     setting: string = CHANGE_NOTIFY_SUPPRESS_SETTING,
 ): Promise<T> {
-    return client.$transaction(async tx => {
-        await tx.$executeRawUnsafe(`SET LOCAL "${setting}" = 'on'`);
+    return withTransaction(client, async tx => {
+        await tx.query(`SET LOCAL "${setting}" = 'on'`);
 
         return fn(tx);
     });

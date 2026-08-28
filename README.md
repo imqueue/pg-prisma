@@ -4,13 +4,16 @@
 [![npm version](https://img.shields.io/npm/v/@imqueue/pg-prisma)](https://www.npmjs.com/package/@imqueue/pg-prisma)
 [![License](https://img.shields.io/badge/license-GPL-blue.svg)](https://github.com/imqueue/pg-prisma/blob/master/LICENSE)
 
-A Prisma/Postgres toolkit for Node.js & TypeScript back-ends — the persistence
-helpers behind @imqueue framework services. It bundles a set of Prisma
-[client extensions](https://www.prisma.io/docs/orm/prisma-client/client-extensions)
-(soft-delete, audit trail, authorship stamping, row-level access scope), Postgres
-operational helpers (row archiving, change-notify triggers, down-migrations, SQL
-log formatting), and a Prisma generator that emits typed
-[@imqueue/rpc](https://github.com/imqueue/rpc) model & repository classes.
+A Prisma Next (8.x) / Postgres toolkit for Node.js & TypeScript back-ends — the
+persistence helpers behind @imqueue framework services. It bundles a set of
+Prisma Next query **middlewares** (soft-delete, authorship stamping, audit
+trail, row-level access scope) that rewrite the statement before it is lowered
+to SQL, plus Postgres operational helpers (row archiving, change-notify
+triggers, SQL log formatting).
+
+Their per-model configuration is **derived from the emitted `contract.json`**
+rather than generated: Prisma Next has no custom-generator protocol and needs
+none, since the contract already names every model, field and physical column.
 
 **Documentation:** full guides, tutorial and API reference at
 [imqueue.org](https://imqueue.org/). Commercial licensing & support for
@@ -32,92 +35,147 @@ version, licence and Node floor for every package:
 
 # Features
 
-- **Soft-delete extension** — transparently excludes soft-deleted rows and turns
-  deletes into `deletedAt` stamps.
-- **Audit extension** — writes an append-only audit trail of INSERT/UPDATE/DELETE.
-- **Authorship extension** — stamps `createdBy`/`updatedBy`/`deletedBy` from a
-  caller-supplied actor id.
-- **Access-scope helper** — `accessWhere(...)` composes row-level access filters
-  (AND of per-level OR groups) onto any Prisma `where`.
-- **Row archiving** — moves aged rows out of hot tables into a mirror `archive`
-  schema on a pg_cron schedule (idempotent DB setup).
-- **Change-notify triggers** — installs Postgres `NOTIFY` triggers for row
-  changes, reporting the schema alongside the table so tables of the same name
-  in different schemas are told apart. `withoutChangeNotify()` lets a bulk
-  write commit without a notification per row.
-- **Down-migrations** — `migrateDown()` undoes applied Prisma migrations (Prisma
-  has no native "down").
-- **SQL log helpers** — `prettifySql()` and cooperative log suppression.
-- **Prisma generator** — emits typed `@imqueue/rpc` models, inputs, query types
-  and repositories from your schema.
-- **TypeScript included!**
+- **Soft delete and authorship** — a `DELETE` becomes a `deletedAt` stamp,
+  stamped rows disappear from reads, and every write records who made it.
+- **Access scope** — every read, update and delete is narrowed to the rows the
+  caller may see, in the data layer rather than at each call site.
+- **Audit trail** — every write to a nominated table recorded with the actor,
+  the action and the row as the database returned it.
+- **Row archiving** — aged rows moved into a mirror `archive` schema on a
+  pg_cron schedule.
+- **Change-notify triggers** — Postgres `NOTIFY` on every row change.
+
+Filtering applies across the **whole statement**, not just its outermost
+`FROM`. Prisma Next compiles a relation read into one statement holding several
+selects, so a filter on the root alone would return soft-deleted and
+out-of-scope rows through any `include`.
 
 # Requirements
 
-- Node.js ≥ 22.12, PostgreSQL, and Prisma **7+**.
-- `@prisma/client` is a **peer dependency** — the extensions import the `Prisma`
-  namespace from `@prisma/client/extension` (the entry for shareable Client
-  extensions), so they work whether you generate your client to the default
-  `@prisma/client` output or to a custom path.
-- Some Postgres features are optional: row archiving schedules via `pg_cron` when
-  available (it degrades gracefully when the extension is absent).
+- Node.js >= 22.12
+- `prisma` 8.x and `@prisma/orm-postgres` (peer dependency)
+- PostgreSQL 15 or newer
 
 # Install
 
 ```bash
-npm i --save @imqueue/pg-prisma
+npm i @imqueue/pg-prisma
 ```
 
 # Usage
 
-## Client extensions
+## The data layer, in one call
 
 ```typescript
-import { PrismaClient } from '@prisma/client';
-import { softDelete, audit, authorship } from '@imqueue/pg-prisma';
+import { dataLayer } from '@imqueue/pg-prisma';
+import postgres from '@prisma/orm-postgres/runtime';
+import type { Contract } from './prisma/contract.d.ts';
+import contractJson from './prisma/contract.json' with { type: 'json' };
 
-// The FIRST-added extension is the OUTERMOST — keep `audit` first so that
-// soft-deletes are still recorded in the audit trail.
-const prisma = new PrismaClient()
-    .$extends(audit({ /* ...config... */ }))
-    .$extends(authorship({ /* ...config... */ }))
-    .$extends(softDelete({ /* ...config... */ }));
+const layer = dataLayer({
+    contract: contractJson,
+    scope: { Portfolio: { portfolio: ['id'] } },
+    resolvers: { portfolio: () => currentPortfolioIds() },
+    getActorId: currentActorId,
+    audit: {
+        connectionString: process.env.DATABASE_URL!,
+        config: { table: 'AuditLog', columns: { /* ... */ } },
+        getPrincipal: currentPrincipal,
+    },
+});
+
+export const db = postgres<Contract>({
+    contractJson,
+    url: process.env.DATABASE_URL!,
+    middleware: layer.middleware,
+});
 ```
+
+`dataLayer` returns the middlewares already composed. That is the point: a
+caller never orders them, and so cannot order them wrongly. Call
+`layer.close()` on shutdown to release the audit pool.
 
 ## Access scope
 
+Scope is the one thing that cannot be derived from the contract — Prisma Next
+has no schema-level annotation to carry it — so it is declared where
+`dataLayer` is called, keyed by model and field:
+
 ```typescript
-import { accessWhere } from '@imqueue/pg-prisma';
-
-const where = accessWhere(
-    callerWhere,
-    { user: ['createdBy'], portfolio: ['portfolioId'] },
-    { user: () => currentUserId, portfolio: () => allowedPortfolioIds },
-);
-```
-
-## Prisma generator
-
-The package ships a Prisma generator that emits typed `@imqueue/rpc` model and
-repository classes. Point a generator block at it in your `schema.prisma`:
-
-```prisma
-generator imq {
-  provider = "node ./node_modules/@imqueue/pg-prisma/src/codegen.js"
+scope: {
+    Portfolio: { portfolio: ['id'] },
+    User:      { user: ['createdBy', 'id'] },
 }
 ```
 
-The generated code assumes your project defines the subpath import aliases
-`#generated/*` and `#prisma` (your `PrismaClient` instance), and imports
-validation decorators from `@imqueue/validation` and RPC decorators from
-`@imqueue/rpc`. Install those alongside this package if you use the generator.
+Columns **within** one level are OR-ed; levels are AND-ed together. A resolver
+returning `undefined` leaves its level inactive, a value or array restricts,
+and `null` or an empty array denies everything. Get the composition backwards
+and the failure is a data leak rather than an error, so a `scope` naming a
+model the contract does not define is a throw, not a silent no-op.
 
-## Down-migrations
+## Emitting the RPC model classes
 
-```bash
-node --import tsx node_modules/@imqueue/pg-prisma/src/migrate-down.js \
-  --database-url "$DATABASE_URL" --steps 1
+Prisma Next emits `contract.d.ts`, which carries the types but not the
+decorated classes. `@classType`/`@property` are what the
+[@imqueue/rpc](https://github.com/imqueue/rpc) client generator reads, and an
+undecorated type is dropped from the generated client with no error — so the
+DTO classes are emitted here, from the same contract:
+
+```typescript
+import { emitModels, parseImportMap } from '@imqueue/pg-prisma';
+
+await writeFile('src/generated/models.ts', emitModels({ contract }));
 ```
+
+### Redirecting the runtime imports
+
+By default the emitted file imports `@imqueue/rpc` directly. Pass `imports` to
+point it somewhere else:
+
+```typescript
+emitModels({
+    contract,
+    imports: parseImportMap('@imqueue/rpc=@my-org/runtime'),
+});
+```
+
+```typescript
+// before
+import { classType, property } from '@imqueue/rpc';
+
+// after
+import { classType, property } from '@my-org/runtime';
+```
+
+**Why this exists.** The decorators are only meaningful to the registry that
+defined them, so `@imqueue/rpc`, `@imqueue/validation` and `zod` each have to
+be a **single copy** shared with the service. A second copy fails silently
+rather than loudly — a second decorator registry nothing reads, or a `ZodError`
+that fails `instanceof`. The reliable way to guarantee one copy is for one
+package to own the dependency and re-export it, with every service taking it
+from there; redirecting the emitted imports is what makes that possible.
+
+Redirecting several runtimes at one package merges them into a single
+statement, rather than emitting the same specifier three times:
+
+```typescript
+parseImportMap(
+    'zod=@base, @imqueue/rpc=@base, @imqueue/validation=@base',
+);
+// import { classType, property, validatable, validate, z } from '@base';
+```
+
+Redirecting a module the generator never emits throws rather than being
+ignored, because the alternative is believing a redirection was applied while
+the generated files still point at the original.
+
+## Composing it yourself
+
+`stamp`, `accessScope` and `audit` are exported individually for cases
+`dataLayer` does not cover, and `deriveDataLayer` produces the config they take.
+The middlewares commute — `stamp` merges what were two order-dependent Prisma 7
+extensions — so there is no required order between them.
 
 ## Running Unit Tests
 

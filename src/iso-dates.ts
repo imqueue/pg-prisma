@@ -1,5 +1,5 @@
 /*!
- * Prisma result extension: Date → ISO-8601 strings
+ * @imqueue/pg-prisma — database timestamps as ISO 8601 instants
  *
  * I'm Queue Software Project
  * Copyright (C) 2025  imqueue.com <support@imqueue.com>
@@ -22,81 +22,134 @@
  * <support@imqueue.com> to get commercial licensing options.
  */
 
-import { Prisma } from '@prisma/client/extension';
+import type { SqlMiddleware } from '@prisma/orm-postgres/family-runtime';
 
 /**
- * Recursively replace every `Date` with its ISO-8601 string, structure intact.
+ * Codecs whose values arrive as Postgres' own timestamp text.
  *
- * Exported so it can be tested without a database, like `accessWhere`: what it
- * does to a shape is the whole of this extension, and the interesting cases —
- * a buffer, a nested date, an array of rows — are all reachable from here.
+ * @remarks
+ * Both are pass-through — `decode` hands back the wire string untouched — so
+ * what a column yields is whatever `SELECT col::text` would print.
  */
-export function toIsoDates(value: unknown): unknown {
-    if (value instanceof Date) {
-        return value.toISOString();
-    }
-    if (Array.isArray(value)) {
-        return value.map(toIsoDates);
-    }
-    /*
-     * Binary is returned as it came, and this is not an optimisation.
-     *
-     * The branch below rebuilds any object by walking `Object.entries`, and a
-     * `Buffer` walked that way becomes `{ "0": 137, "1": 80, … }` — a plain
-     * object with one key per byte, which is no longer a buffer, is roughly
-     * fifty times the size, and fails every `Buffer.isBuffer` check downstream.
-     * A `Bytes` column read through this extension arrived unusable and the
-     * failure looked like the row not existing.
-     *
-     * `ArrayBuffer.isView` covers `Buffer`, every typed array and `DataView`;
-     * the buffer itself is checked beside it. None of them can contain a
-     * `Date`, so there is nothing here to walk for.
-     */
-    if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) {
-        return value;
-    }
-    if (value !== null && typeof value === 'object') {
-        const out: Record<string, unknown> = {};
-        for (const [key, nested] of Object.entries(value)) {
-            out[key] = toIsoDates(nested);
-        }
+export const TIMESTAMP_CODECS: ReadonlySet<string> = new Set([
+    'pg/timestamptz-string@1',
+    'pg/timestamp-string@1',
+]);
 
-        return out;
-    }
+/**
+ * `2026-08-14 09:30:00.123+00`, and every shape Postgres prints around it:
+ * a space for the `T`, the fraction trimmed of trailing zeros or absent
+ * altogether, and an offset only when the column carries a zone.
+ */
+const PG_TIMESTAMP =
+    /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?([+-]\d{2}(:?\d{2})?)?$/;
 
-    return value;
+/** The zone the value ends in, if it states one at all. */
+const OFFSET = /([+-])(\d{2}):?(\d{2})?$/;
+
+/** Everything {@link isoDates} needs. */
+export interface IsoDateOptions {
+    /** Columns stored under one of {@link TIMESTAMP_CODECS}. */
+    columns: ReadonlySet<string>;
 }
 
 /**
- * Build the query extension that serializes every `Date` in a query result to an
- * ISO-8601 string.
+ * Read database timestamps back as canonical ISO 8601 instants.
  *
  * @remarks
- * The generated `@imqueue/rpc` models type Prisma's `DateTime` as `string` (the
- * codegen `scalars` config decides this), so a service that returned Prisma's own
- * `Date` objects would be handing callers a shape its own types disagree with.
- * This extension closes that gap at the boundary rather than at every call site.
+ * Postgres prints a timestamp as `2026-08-14 09:30:00.123+00` — a space where
+ * ISO 8601 puts a `T`, `+00` where it puts `Z`, and a fraction stripped of its
+ * trailing zeros, so `09:30:00.500` comes back as `09:30:00.5` and a whole
+ * second as no fraction at all. Nothing downstream accepts that: the GraphQL
+ * `DateTime` scalar rejects it outright, and so does `z.iso.datetime()`. This
+ * restores the one spelling every boundary agrees on, which is what Prisma 7's
+ * `scalars = "DateTime:string"` used to produce.
  *
- * Conversion walks the whole result recursively — arrays, nested objects and
- * relations included — and leaves structure and every non-`Date` value untouched.
- * It applies to results only: `Date` values you pass IN as query arguments are
- * still handed to Prisma as `Date`.
+ * A column that carries no zone is read as UTC rather than as a wall clock.
+ * Left to `new Date`, such a value is parsed as **local** time, so on a host
+ * that is not UTC every instant read from the database is silently shifted and
+ * an expiry compares against the wrong moment — which is why the columns are
+ * `timestamptz` and this is only the fallback for one that is not.
  *
- * @returns A Prisma extension to pass to `client.$extends()`.
+ * Sub-millisecond precision does not survive, because a JavaScript instant has
+ * none to survive into.
+ *
+ * Writes need nothing: Postgres parses an ISO 8601 string on its own, so a
+ * value handed back unchanged can be sent straight back.
+ *
+ * Both the column name and the value's shape have to match, so a text column
+ * that happens to hold something timestamp-like is left alone.
+ *
+ * @param options - The columns to convert.
+ * @returns Middleware converting those columns on every row read.
  * @example
  * ```typescript
- * const client = new PrismaClient().$extends(isoDates());
+ * const middleware = [isoDates({ columns: derived.dates })];
  * ```
  */
-export function isoDates() {
-    return Prisma.defineExtension({
+export function isoDates({ columns }: IsoDateOptions): SqlMiddleware {
+    // Postgres writes the offset as `+00`, which the ISO parser does not
+    // accept — only the legacy one does, and what that accepts is not
+    // specified. So the value is spelled out in full before it is parsed.
+    const iso = (value: string): string => {
+        const offset = OFFSET.exec(value);
+
+        if (!offset) {
+            return `${value.replace(' ', 'T')}Z`;
+        }
+
+        return (
+            value.slice(0, offset.index).replace(' ', 'T') +
+            `${offset[1]}${offset[2]}:${offset[3] ?? '00'}`
+        );
+    };
+
+    const convert = (value: unknown): unknown => {
+        if (typeof value !== 'string' || !PG_TIMESTAMP.test(value)) {
+            return value;
+        }
+
+        const parsed = new Date(iso(value));
+
+        // A shape this matches but a calendar rejects — `2026-02-30`, say.
+        // Handing back the original loses nothing; throwing would fail the
+        // whole read over one column.
+        return Number.isNaN(parsed.getTime()) ? value : parsed.toISOString();
+    };
+
+    // Included relations arrive nested, so the walk goes all the way down
+    // rather than over the top-level columns only.
+    const walk = (node: unknown): void => {
+        if (Array.isArray(node)) {
+            node.forEach(walk);
+
+            return;
+        }
+
+        if (!node || typeof node !== 'object') {
+            return;
+        }
+
+        for (const [key, value] of Object.entries(node)) {
+            if (value && typeof value === 'object') {
+                walk(value);
+
+                continue;
+            }
+
+            if (columns.has(key)) {
+                (node as Record<string, unknown>)[key] = convert(value);
+            }
+        }
+    };
+
+    return {
         name: 'iso-dates',
-        query: {
-            $allModels: {
-                async $allOperations({ args, query }) {
-                    return toIsoDates(await query(args));
-                },
-            },
+        familyId: 'sql' as const,
+        onRow(row: Record<string, unknown>): Promise<void> {
+            walk(row);
+
+            return Promise.resolve();
         },
-    });
+    };
 }

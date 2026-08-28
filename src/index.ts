@@ -1,8 +1,8 @@
 /*!
- * @imqueue/pg-prisma — public API
+ * Prisma Next (8.x) query middlewares for @imqueue services
  *
  * I'm Queue Software Project
- * Copyright (C) 2025  imqueue.com <support@imqueue.com>
+ * Copyright (C) 2026  imqueue.com <support@imqueue.com>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -25,10 +25,21 @@
 export * from './access-scope.js';
 export * from './archive.js';
 export * from './audit.js';
-export * from './authorship.js';
 export * from './change-notify.js';
+export * from './data-layer.js';
+export * from './derive.js';
+export * from './emit/imports.js';
+export * from './emit/all.js';
+export * from './emit/models.js';
+export * from './emit/rpc.js';
 export * from './iso-dates.js';
-export * from './migrate-down.js';
+export * from './pool.js';
 export * from './pretty-sql.js';
-export * from './soft-delete.js';
+export * from './query-log.js';
+export * from './query.js';
+export * from './repository.js';
+export * from './sql-client.js';
 export * from './sql-log.js';
+export * from './sql-runner.js';
+export * from './sql-template.js';
+export * from './stamp.js';

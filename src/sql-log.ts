@@ -60,7 +60,7 @@ export function isSqlLogSuppressed(): boolean {
  * @returns Whatever `fn` resolves to.
  * @example
  * ```typescript
- * await silently(() => client.$executeRawUnsafe(startupDdl));
+ * await silently(() => pool.query(startupDdl));
  * ```
  */
 export async function silently<T>(fn: () => Promise<T>): Promise<T> {

@@ -23,32 +23,34 @@
  */
 
 /**
- * Prisma and Postgres building blocks for `@imqueue` services.
+ * Prisma Next (8.x) and Postgres building blocks for `@imqueue` services.
  *
  * Two kinds of thing live here, and they are used at different times.
  *
- * Query extensions wrap a `PrismaClient` and change what queries do:
- * `softDelete` turns deletes into `deletedAt` stamps and hides stamped rows,
- * `accessScope` narrows every read to the records the caller is allowed to see,
- * `authorship` stamps who created, updated or deleted a row, `audit` writes a
- * trail of every write to a table you nominate, and `isoDates` serializes `Date`
- * values so they survive the RPC wire as ISO strings. Each is independent; each is
- * driven by a per-model config the code generator emits from your Prisma schema.
+ * Query middlewares rewrite the statement before it is lowered to SQL:
+ * `stamp` turns deletes into `deletedAt` stamps, hides stamped rows and records
+ * who created, updated or deleted a row; `accessScope` narrows every read to
+ * the records the caller is allowed to see; and `audit` writes a trail of every
+ * write to a table you nominate. `dataLayer` builds all three from an emitted
+ * contract in one call and is the entry point for the ordinary case — the
+ * individual factories are there to compose something it does not cover.
  *
  * Installers and tools run once at startup or by hand rather than per query:
- * `installArchiving` moves aged rows into a mirror `archive` schema on a pg_cron
- * schedule, `installChangeTriggers` makes Postgres `NOTIFY` on every row change,
- * `migrateDown` rolls applied migrations back (Prisma has no native "down"), and
- * `prettifySql`/`silently`/`isSqlLogSuppressed` are query-logging helpers.
+ * `installArchiving` moves aged rows into a mirror `archive` schema on a
+ * pg_cron schedule, `installChangeTriggers` makes Postgres `NOTIFY` on every
+ * row change, and `prettifySql`/`silently`/`isSqlLogSuppressed` are
+ * query-logging helpers.
  *
- * Ordering matters when extensions are combined, because Prisma runs the
- * first-added query hook outermost. `audit` has to be added first if it is to see
- * operations that `softDelete` reroutes; the individual pages say so where it
- * applies.
+ * The per-model configuration is **derived from `contract.json`** by
+ * `deriveDataLayer` rather than generated: Prisma Next has no custom-generator
+ * protocol and needs none, since the contract already names every model, field
+ * and physical column. Nothing is written to disk and nothing can go stale
+ * against the schema. Access levels are the one thing that cannot be derived —
+ * Prisma Next has no schema annotation to carry them — so they are declared
+ * where `dataLayer` is called.
  *
- * The Prisma generator that emits typed `@imqueue/rpc` models from your schema
- * ships separately at `@imqueue/pg-prisma/codegen` and is invoked by Prisma, not
- * imported — it is deliberately absent from this barrel.
+ * The middlewares commute: `stamp` merges what were two order-dependent
+ * Prisma 7 extensions, so there is no ordering left for a caller to get wrong.
  *
  * @packageDocumentation
  */
