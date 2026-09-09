@@ -476,12 +476,22 @@ export function emitRpcTypes({
             .join('\n') +
         '\n}\n';
 
+    const emitted =
+        `${SHARED}\n${repositories}\n${nestedClasses.join('\n')}\n` +
+        `${body.join('\n')}`;
+    /* `JsonValue` is declared beside the classes, so this file takes it from
+       there rather than restating a type two files would then have to agree
+       on. Named only where something uses it, like every other import here. */
+    const named = [
+        ...Object.keys(models),
+        ...(emitted.includes('JsonValue') ? ['JsonValue'] : []),
+    ].sort();
+
     return (
         `${emitImports(['rpc', 'validation', 'zod', 'repository'], imports)}` +
-        `import type {\n${Object.keys(models)
+        `import type {\n${named
             .map(name => `    ${name},`)
             .join('\n')}\n} from './models.js';\n\n` +
-        `${SHARED}\n${repositories}\n${nestedClasses.join('\n')}\n` +
-        `${body.join('\n')}`
+        emitted
     );
 }
