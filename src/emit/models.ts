@@ -24,6 +24,21 @@
 
 import { type ImportMap, emitImports } from './imports.js';
 
+/**
+ * What a JSON column can hold, which is any JSON value and not only an object.
+ *
+ * Emitted beside the classes rather than imported, because the generated files
+ * import nothing but the runtime.
+ */
+const JSON_VALUE_TYPE =
+    'export type JsonValue =\n' +
+    '    | string\n' +
+    '    | number\n' +
+    '    | boolean\n' +
+    '    | null\n' +
+    '    | JsonValue[]\n' +
+    '    | { [key: string]: JsonValue };\n';
+
 /** How a Postgres codec is spelled in TypeScript. */
 const TS_TYPE: Record<string, string> = {
     'pg/bool@1': 'boolean',
@@ -34,13 +49,30 @@ const TS_TYPE: Record<string, string> = {
     'pg/int2@1': 'number',
     'pg/int4@1': 'number',
     'pg/int8@1': 'string',
-    'pg/json@1': 'Record<string, unknown>',
-    'pg/jsonb@1': 'Record<string, unknown>',
+    'pg/json@1': 'JsonValue',
+    'pg/jsonb@1': 'JsonValue',
     'pg/numeric@1': 'string',
     'pg/text@1': 'string',
     'pg/timestamp-string@1': 'string',
     'pg/timestamptz-string@1': 'string',
     'pg/uuid@1': 'string',
+};
+
+/**
+ * How a codec is spelled in the published `@property` description, where that
+ * differs from the TypeScript type.
+ *
+ * A JSON column holds any JSON value, which is what {@link TS_TYPE} now says.
+ * The description cannot follow it there: `@property` carries a name the client
+ * generator resolves, a type alias is compile-time only and reaches the client
+ * as whatever it widened to, and `JsonValue` is recursive besides. So the wire
+ * keeps the spelling it has always had and only the service's own types are
+ * made honest — a column that holds a string stops being typed as an object in
+ * the code that reads it.
+ */
+const WIRE_TYPE: Record<string, string> = {
+    'pg/json@1': 'Record<string, unknown>',
+    'pg/jsonb@1': 'Record<string, unknown>',
 };
 
 interface FieldType {
@@ -186,15 +218,19 @@ export function typeOf(
         field.type?.typeParams?.typeName ??
         listEnum;
     const members = named ? enums[named]?.members : undefined;
+    const codec = field.type?.codecId ?? '';
     const base = members
         ? members.map(member => `'${member.value}'`).join(' | ')
-        : (TS_TYPE[field.type?.codecId ?? ''] ?? 'unknown');
+        : (TS_TYPE[codec] ?? 'unknown');
+    const wireBase = members
+        ? base
+        : (WIRE_TYPE[codec] ?? TS_TYPE[codec] ?? 'unknown');
     // `'A' | 'B'[]` parses as `'A' | ('B'[])`; a union has to be parenthesised
     // before the array suffix.
     const listed = field.many
         ? `${base.includes('|') ? `(${base})` : base}[]`
         : base;
-    const wire = field.many ? `Array<${base}>` : base;
+    const wire = field.many ? `Array<${wireBase}>` : wireBase;
 
     return {
         ts: field.nullable ? `${listed} | null` : listed,
@@ -356,7 +392,13 @@ export function emitModels({
         );
     });
 
-    return `${emitImports(['rpc'], imports)}\n${classes.join('\n')}`;
+    /* Only where something uses it: an unused alias in a generated file is a
+       line every reader has to account for. */
+    const json = classes.some(one => one.includes('JsonValue'))
+        ? `\n${JSON_VALUE_TYPE}`
+        : '';
+
+    return `${emitImports(['rpc'], imports)}\n${json}${classes.join('\n')}`;
 }
 
 /**

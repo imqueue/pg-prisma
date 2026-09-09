@@ -50,6 +50,10 @@ const contract = {
                                 many: true,
                                 type: { codecId: 'pg/text@1' },
                             },
+                            settings: {
+                                nullable: true,
+                                type: { codecId: 'pg/jsonb@1' },
+                            },
                         },
                         relations: {
                             posts: {
@@ -169,4 +173,51 @@ test('an enum member takes the name it is given', () => {
 
 test('an enum with no names given keeps its labels', () => {
     assert.match(emitEnums({ contract }), /EMAIL: 'EMAIL',/);
+});
+
+/*
+ * A JSON column holds any JSON value — a string, a number, a list — and typing
+ * it as an object made every one of those an error at the call site that wrote
+ * it, while working perfectly at run time.
+ *
+ * The published description cannot follow: `@property` carries a name the
+ * client generator resolves, and a recursive alias reaches it as whatever it
+ * widened to. So the two deliberately differ, and only the code that reads the
+ * column is made honest.
+ */
+test('a json column is any json value in TypeScript', () => {
+    assert.match(line('settings'), /settings\?: JsonValue \| null;/);
+});
+
+test('and stays an object on the wire, where a union cannot travel', () => {
+    assert.match(
+        line('settings'),
+        /@property\('Record<string, unknown>', true\)/,
+    );
+});
+
+test('the alias is emitted beside the classes that use it', () => {
+    assert.match(emitted, /export type JsonValue =/u);
+});
+
+test('and is left out where nothing does', () => {
+    const plain = emitModels({
+        contract: {
+            domain: {
+                namespaces: {
+                    public: {
+                        models: {
+                            Thing: {
+                                fields: {
+                                    id: { type: { codecId: 'pg/text@1' } },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    });
+
+    assert.doesNotMatch(plain, /JsonValue/u);
 });
