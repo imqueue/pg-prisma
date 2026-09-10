@@ -1,6 +1,6 @@
 {
   "name": "@imqueue/pg-prisma",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "description": "Prisma Next (8.x) / Postgres toolkit for Node.js & TypeScript microservices — query middlewares (soft-delete, authorship, audit, access-scope) derived from the emitted contract, row archiving and change-notify triggers (the @imqueue framework)",
   "keywords": [
     "prisma",
