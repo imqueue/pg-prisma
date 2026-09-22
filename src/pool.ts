@@ -25,6 +25,27 @@
 import pg from 'pg';
 import type { Pool, PoolConfig, PoolClient } from 'pg';
 
+/**
+ * Keep a pool's lost idle connection from ending the process.
+ *
+ * @remarks
+ * When the server closes a connection the pool is holding idle — a
+ * `pg_terminate_backend`, a failover, a maintenance restart — `pg` emits
+ * `error` on the pool itself. With no listener, that is an unhandled `error`
+ * event and Node exits. The pool has already discarded the client by then and
+ * the next checkout opens a fresh one, so the only thing left to do is say so.
+ *
+ * @param pool - The pool to guard.
+ * @returns The same pool.
+ */
+export function survivesLostConnections<P extends Pool>(pool: P): P {
+    pool.on('error', error => {
+        console.error(`pg pool: idle connection lost: ${error.message}`);
+    });
+
+    return pool;
+}
+
 /** `text[]`, whose wire format an array of enums shares exactly. */
 const TEXT_ARRAY = 1009;
 
@@ -107,7 +128,7 @@ export function dataPool(
     config: PoolConfig,
     parsers: TypeParsers = pg.types as unknown as TypeParsers,
 ): Pool {
-    const pool = new pg.Pool(config);
+    const pool = survivesLostConnections(new pg.Pool(config));
 
     // Bound before the override, so neither the lookup below nor the callback
     // form calls itself.

@@ -26,6 +26,7 @@ import pg from 'pg';
 import type { SqlMiddleware } from '@prisma/orm-postgres/family-runtime';
 import type { AnyQueryAst } from '@prisma/orm-postgres/relational-core/ast';
 import type { StampTables } from './derive.js';
+import { survivesLostConnections } from './pool.js';
 
 /** The three write actions the trail records. */
 export const AuditAction = {
@@ -148,7 +149,7 @@ export function audit({
     stamps = {},
     getPrincipal,
 }: AuditOptions): SqlMiddleware & { close(): Promise<void> } {
-    const pool = new pg.Pool({ connectionString });
+    const pool = survivesLostConnections(new pg.Pool({ connectionString }));
     const table = config.table ?? DEFAULTS.table;
     const col = { ...DEFAULTS.columns, ...config.columns };
     const pending = new WeakMap<object, Batch>();
