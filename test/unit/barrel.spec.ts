@@ -69,6 +69,7 @@ const EXPORTS = [
     'sql',
     'sqlRunner',
     'stamp',
+    'survivesLostConnections',
     'toOrdering',
     'toPredicate',
     'toProjection',
