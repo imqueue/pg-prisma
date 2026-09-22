@@ -68,3 +68,25 @@ test('a validated string is still a string', () => {
 
     assert.match(out, /@validate\(z\.string\(\)\.min\(1\)/);
 });
+
+// A service that is not an @imqueue service validates at its own edge and
+// publishes nothing over a queue: its generated shapes are plain classes,
+// and nothing in them loads the RPC runtime.
+test('without decorators the shapes are plain classes', () => {
+    const out = emitRpcTypes({
+        contract: contract as never,
+        validation: { User: { age: '.int().min(0)' } },
+        decorators: false,
+    });
+
+    assert.doesNotMatch(
+        out,
+        /^\s*@(classType|property|validatable|validate)\(/mu,
+    );
+    assert.doesNotMatch(out, /@imqueue\/(rpc|validation)|from 'zod'/u);
+    assert.match(
+        out,
+        /^import type \{ Repository \} from '@imqueue\/pg-prisma';/mu,
+    );
+    assert.match(out, /^export class UserCreateInput \{\n {4}id\?: string;/mu);
+});

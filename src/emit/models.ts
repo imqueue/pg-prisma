@@ -22,6 +22,7 @@
  * <support@imqueue.com> to get commercial licensing options.
  */
 
+import { decorations } from './decorations.js';
 import { type ImportMap, emitImports } from './imports.js';
 
 /**
@@ -190,18 +191,17 @@ export interface EmitModelsOptions {
      * a failure has to be explainable, and published to nobody.
      */
     omit?: readonly string[];
+    /**
+     * Whether the classes carry the @imqueue decorators. Defaults to `true`.
+     *
+     * @remarks
+     * `false` emits plain classes and no import of `@imqueue/rpc`, for a
+     * service that is not an @imqueue service. See `Decorations`.
+     */
+    decorators?: boolean;
 }
 
-/**
- * Quote a `@property` type string.
- *
- * @remarks
- * An enum renders as a union of single-quoted members, so the surrounding
- * quote has to be the other one or the decorator argument does not parse.
- */
-export function quoted(value: string): string {
-    return value.includes("'") ? `"${value}"` : `'${value}'`;
-}
+export { quoted } from './decorations.js';
 
 /** The TypeScript spelling of a field, and the `@property` type string. */
 export function typeOf(
@@ -355,8 +355,10 @@ export function emitModels({
     namespace,
     imports = {},
     omit = [],
+    decorators = true,
 }: EmitModelsOptions): string {
     const { models, enums, columnsOf } = namespaceOf(contract, namespace, omit);
+    const d = decorations(decorators);
 
     const classes = Object.entries(models).map(([name, model]) => {
         const columns = columnsOf[name]?.columns ?? {};
@@ -368,10 +370,7 @@ export function emitModels({
                     columns[field]?.valueSet?.entityName,
                 );
 
-                return (
-                    `    @property(${quoted(wire)}, true)\n` +
-                    `    ${field}?: ${ts};\n`
-                );
+                return `${d.property(wire)}    ${field}?: ${ts};\n`;
             },
         );
         const relations = Object.entries(model.relations ?? {}).map(
@@ -381,12 +380,12 @@ export function emitModels({
                 const wire = many ? `Array<${target}>` : target;
                 const ts = many ? `${target}[]` : `${target} | null`;
 
-                return `    @property('${wire}', true)\n    ${field}?: ${ts};\n`;
+                return `${d.property(wire)}    ${field}?: ${ts};\n`;
             },
         );
 
         return (
-            `@classType()\nexport class ${name} {\n` +
+            `${d.classType()}export class ${name} {\n` +
             [...fields, ...relations].join('\n') +
             '}\n'
         );
@@ -398,7 +397,12 @@ export function emitModels({
         ? `\n${JSON_VALUE_TYPE}`
         : '';
 
-    return `${emitImports(['rpc'], imports)}\n${json}${classes.join('\n')}`;
+    // With no import there is nothing for the blank line to separate.
+    const header = d.enabled
+        ? `${emitImports(['rpc'], imports)}\n${json}`
+        : json.replace(/^\n/, '');
+
+    return `${header}${classes.join('\n')}`;
 }
 
 /**

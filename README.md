@@ -170,6 +170,28 @@ Redirecting a module the generator never emits throws rather than being
 ignored, because the alternative is believing a redirection was applied while
 the generated files still point at the original.
 
+### Without the decorators
+
+A service that is not an @imqueue service — a REST API that validates at its
+own edge and publishes nothing over a queue — has no use for the decorators,
+and carrying them would tie its generated code to a runtime it never loads.
+Pass `decorators: false` and the classes are plain TypeScript: no
+`@classType`, `@property`, `@validatable` or `@validate`, and no import of
+`@imqueue/rpc`, `@imqueue/validation` or `zod`. Validation rules are ignored in
+this mode. The default is `true`, and the output with it is unchanged.
+
+```typescript
+await emitAll({ contract, outDir: 'src/generated/', decorators: false });
+```
+
+```typescript
+// models.ts
+export class User {
+    id?: string;
+    name?: string;
+}
+```
+
 ## Composing it yourself
 
 `stamp`, `accessScope` and `audit` are exported individually for cases

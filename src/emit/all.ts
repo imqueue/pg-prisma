@@ -51,6 +51,11 @@ export interface EmitAllOptions {
     omit?: readonly string[];
     /** Names for enum members whose database label is not the name. */
     enums?: EnumNames;
+    /**
+     * Whether the classes carry the @imqueue decorators. Defaults to `true`;
+     * `false` is for a service that is not an @imqueue service.
+     */
+    decorators?: boolean;
 }
 
 /** One emitted file. */
@@ -94,6 +99,7 @@ export async function emitAll({
     fields,
     omit,
     enums,
+    decorators,
 }: EmitAllOptions): Promise<string[]> {
     const dir = outDir instanceof URL ? outDir : new URL(`file://${outDir}/`);
     const shared = {
@@ -101,16 +107,22 @@ export async function emitAll({
         ...(namespace ? { namespace } : {}),
         ...(omit ? { omit } : {}),
     };
+    const decorated = decorators === undefined ? {} : { decorators };
     const written: [string, string][] = [
         [FILES.enums, emitEnums({ ...shared, ...(enums ? { enums } : {}) })],
         [
             FILES.models,
-            emitModels({ ...shared, ...(imports ? { imports } : {}) }),
+            emitModels({
+                ...shared,
+                ...decorated,
+                ...(imports ? { imports } : {}),
+            }),
         ],
         [
             FILES.rpc,
             emitRpcTypes({
                 ...shared,
+                ...decorated,
                 ...(validation ? { validation } : {}),
                 ...(imports ? { imports } : {}),
                 ...(fields ? { fields } : {}),

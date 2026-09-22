@@ -22,6 +22,7 @@
  * <support@imqueue.com> to get commercial licensing options.
  */
 
+import { type Decorations, decorations } from './decorations.js';
 import { type ImportMap, emitImports } from './imports.js';
 import {
     type EmitContract,
@@ -29,7 +30,6 @@ import {
     type Model,
     hasDatabaseDefault,
     namespaceOf,
-    quoted,
     typeOf,
 } from './models.js';
 import { type DeriveFields, deriveDataLayer } from '../derive.js';
@@ -63,66 +63,39 @@ export interface EmitRpcOptions extends Omit<EmitModelsOptions, 'imports'> {
     fields?: DeriveFields;
 }
 
-const SHARED = `@classType()
-export class PageOptions {
-    @property('number', true)
-    skip?: number;
-
-    @property('number', true)
-    take?: number;
-
-    @property('boolean', true)
-    withTotal?: boolean;
+/** The classes every model's shapes lean on, emitted once per file. */
+function shared(d: Decorations): string {
+    return [
+        `${d.classType()}export class PageOptions {\n` +
+            member(d, 'number', 'skip', 'number') +
+            '\n' +
+            member(d, 'number', 'take', 'number') +
+            '\n' +
+            member(d, 'boolean', 'withTotal', 'boolean') +
+            '}\n',
+        `${d.classType()}export class BulkCount {\n` +
+            member(d, 'number', 'count', 'number', false) +
+            '}\n',
+        `${d.classType()}export class CountOrderBy {\n` +
+            member(d, "'asc' | 'desc'", '_count', "'asc' | 'desc'") +
+            '}\n',
+        `${d.classType()}export class ValueWhere {\n` +
+            [
+                member(d, 'unknown', 'eq', 'unknown'),
+                member(d, 'unknown', 'not', 'unknown'),
+                member(d, 'Array<unknown>', 'in', 'unknown[]'),
+                member(d, 'Array<unknown>', 'notIn', 'unknown[]'),
+                member(d, 'unknown', 'lt', 'unknown'),
+                member(d, 'unknown', 'lte', 'unknown'),
+                member(d, 'unknown', 'gt', 'unknown'),
+                member(d, 'unknown', 'gte', 'unknown'),
+                member(d, 'string', 'contains', 'string'),
+                member(d, 'string', 'startsWith', 'string'),
+                member(d, 'string', 'endsWith', 'string'),
+            ].join('\n') +
+            '}\n',
+    ].join('\n');
 }
-
-@classType()
-export class BulkCount {
-    @property('number')
-    count!: number;
-}
-
-@classType()
-export class CountOrderBy {
-    @property("'asc' | 'desc'", true)
-    _count?: 'asc' | 'desc';
-}
-
-@classType()
-export class ValueWhere {
-    @property('unknown', true)
-    eq?: unknown;
-
-    @property('unknown', true)
-    not?: unknown;
-
-    @property('Array<unknown>', true)
-    in?: unknown[];
-
-    @property('Array<unknown>', true)
-    notIn?: unknown[];
-
-    @property('unknown', true)
-    lt?: unknown;
-
-    @property('unknown', true)
-    lte?: unknown;
-
-    @property('unknown', true)
-    gt?: unknown;
-
-    @property('unknown', true)
-    gte?: unknown;
-
-    @property('string', true)
-    contains?: string;
-
-    @property('string', true)
-    startsWith?: string;
-
-    @property('string', true)
-    endsWith?: string;
-}
-`;
 
 /** `@property(...)` plus the field line, at one indent. */
 /**
@@ -150,18 +123,20 @@ function zodBase(ts: string | undefined): string {
 }
 
 function member(
+    d: Decorations,
     wire: string,
     name: string,
     ts: string,
     optional = true,
 ): string {
     return (
-        `    @property(${quoted(wire)}${optional ? ', true' : ''})\n` +
+        d.property(wire, optional) +
         `    ${name}${optional ? '?' : '!'}: ${ts};\n`
     );
 }
 
 function whereClass(
+    d: Decorations,
     name: string,
     model: Model,
     fields: Record<string, { ts: string; wire: string }>,
@@ -169,6 +144,7 @@ function whereClass(
     const logical = ['AND', 'OR', 'NOT']
         .map(key =>
             member(
+                d,
                 `${name}Where | Array<${name}Where>`,
                 key,
                 `${name}Where | ${name}Where[]`,
@@ -178,6 +154,7 @@ function whereClass(
     const scalars = Object.keys(model.fields ?? {})
         .map(field =>
             member(
+                d,
                 `${fields[field]?.wire} | ValueWhere`,
                 field,
                 `${fields[field]?.ts} | ValueWhere`,
@@ -187,6 +164,7 @@ function whereClass(
     const relations = Object.entries(model.relations ?? {})
         .map(([field, relation]) =>
             member(
+                d,
                 `${relation.to?.model}Where`,
                 field,
                 `${relation.to?.model}Where`,
@@ -194,7 +172,7 @@ function whereClass(
         )
         .join('\n');
 
-    return `@classType()\nexport class ${name}Where {\n${[
+    return `${d.classType()}export class ${name}Where {\n${[
         logical,
         scalars,
         relations,
@@ -203,13 +181,14 @@ function whereClass(
         .join('\n')}}\n`;
 }
 
-function selectClass(name: string, model: Model): string {
+function selectClass(d: Decorations, name: string, model: Model): string {
     const scalars = Object.keys(model.fields ?? {})
-        .map(field => member('boolean', field, 'boolean'))
+        .map(field => member(d, 'boolean', field, 'boolean'))
         .join('\n');
     const relations = Object.entries(model.relations ?? {})
         .map(([field, relation]) =>
             member(
+                d,
                 `boolean | ${relation.to?.model}Select`,
                 field,
                 `boolean | ${relation.to?.model}Select`,
@@ -217,20 +196,21 @@ function selectClass(name: string, model: Model): string {
         )
         .join('\n');
 
-    return `@classType()\nexport class ${name}Select {\n${[scalars, relations]
+    return `${d.classType()}export class ${name}Select {\n${[scalars, relations]
         .filter(Boolean)
         .join('\n')}}\n`;
 }
 
-function orderByClass(name: string, model: Model): string {
+function orderByClass(d: Decorations, name: string, model: Model): string {
     const scalars = Object.keys(model.fields ?? {})
-        .map(field => member("'asc' | 'desc'", field, "'asc' | 'desc'"))
+        .map(field => member(d, "'asc' | 'desc'", field, "'asc' | 'desc'"))
         .join('\n');
     const relations = Object.entries(model.relations ?? {})
         .map(([field, relation]) =>
             relation.cardinality?.endsWith(':N')
-                ? member('CountOrderBy', field, 'CountOrderBy')
+                ? member(d, 'CountOrderBy', field, 'CountOrderBy')
                 : member(
+                      d,
                       `${relation.to?.model}OrderBy`,
                       field,
                       `${relation.to?.model}OrderBy`,
@@ -238,7 +218,10 @@ function orderByClass(name: string, model: Model): string {
         )
         .join('\n');
 
-    return `@classType()\nexport class ${name}OrderBy {\n${[scalars, relations]
+    return `${d.classType()}export class ${name}OrderBy {\n${[
+        scalars,
+        relations,
+    ]
         .filter(Boolean)
         .join('\n')}}\n`;
 }
@@ -253,10 +236,11 @@ function orderByClass(name: string, model: Model): string {
  * separate inserts in one transaction, and connecting an existing row is a
  * plain foreign-key update instead.
  */
-function nestedClass(child: string): string {
+function nestedClass(d: Decorations, child: string): string {
     return (
-        `@classType()\nexport class ${child}CreateNestedMany {\n` +
+        `${d.classType()}export class ${child}CreateNestedMany {\n` +
         member(
+            d,
             `Array<${child}CreateInput>`,
             'create',
             `${child}CreateInput[]`,
@@ -266,6 +250,7 @@ function nestedClass(child: string): string {
 }
 
 function inputClass(
+    d: Decorations,
     name: string,
     kind: 'Create' | 'Update',
     model: Model,
@@ -285,13 +270,16 @@ function inputClass(
                       !supplied(name, field);
             const rule = rules[field];
             const zod = rule
-                ? `    @validate(${zodBase(fields[field]?.ts)}${rule}` +
-                  `${required ? '' : '.optional()'})\n`
+                ? d.validate(
+                      `${zodBase(fields[field]?.ts)}${rule}` +
+                          `${required ? '' : '.optional()'}`,
+                  )
                 : '';
 
             return (
                 zod +
                 member(
+                    d,
                     fields[field]?.wire ?? 'unknown',
                     field,
                     fields[field]?.ts ?? 'unknown',
@@ -309,6 +297,7 @@ function inputClass(
                   )
                   .map(([field, relation]) =>
                       member(
+                          d,
                           `${relation.to?.model}CreateNestedMany`,
                           field,
                           `${relation.to?.model}CreateNestedMany`,
@@ -318,46 +307,58 @@ function inputClass(
             : '';
 
     return (
-        `@classType()\n@validatable()\nexport class ${name}${kind}Input {\n` +
+        `${d.classType()}${d.validatable()}export class ${name}${kind}Input {\n` +
         `${[body, nested].filter(Boolean).join('\n')}}\n`
     );
 }
 
-function argClasses(name: string): string {
+function argClasses(d: Decorations, name: string): string {
     return [
-        `@classType()\n@validatable()\nexport class ${name}CreateArgs {\n` +
-            `    @validate(${name}CreateInput)\n` +
-            member(`${name}CreateInput`, 'input', `${name}CreateInput`, false) +
+        `${d.classType()}${d.validatable()}export class ${name}CreateArgs {\n` +
+            d.validate(`${name}CreateInput`) +
+            member(
+                d,
+                `${name}CreateInput`,
+                'input',
+                `${name}CreateInput`,
+                false,
+            ) +
             '\n' +
-            member(`${name}Select`, 'select', `${name}Select`) +
+            member(d, `${name}Select`, 'select', `${name}Select`) +
             '}\n',
-        `@classType()\n@validatable()\nexport class ${name}UpdateArgs {\n` +
-            `    @validate(${name}UpdateInput)\n` +
-            member(`${name}UpdateInput`, 'input', `${name}UpdateInput`, false) +
+        `${d.classType()}${d.validatable()}export class ${name}UpdateArgs {\n` +
+            d.validate(`${name}UpdateInput`) +
+            member(
+                d,
+                `${name}UpdateInput`,
+                'input',
+                `${name}UpdateInput`,
+                false,
+            ) +
             '\n' +
-            member(`${name}Select`, 'select', `${name}Select`) +
+            member(d, `${name}Select`, 'select', `${name}Select`) +
             '}\n',
-        `@classType()\nexport class ${name}SingleArgs {\n` +
-            member(`${name}Where`, 'where', `${name}Where`, false) +
+        `${d.classType()}export class ${name}SingleArgs {\n` +
+            member(d, `${name}Where`, 'where', `${name}Where`, false) +
             '\n' +
-            member(`${name}Select`, 'select', `${name}Select`) +
+            member(d, `${name}Select`, 'select', `${name}Select`) +
             '}\n',
-        `@classType()\nexport class ${name}ListArgs {\n` +
-            member(`${name}Where`, 'where', `${name}Where`) +
+        `${d.classType()}export class ${name}ListArgs {\n` +
+            member(d, `${name}Where`, 'where', `${name}Where`) +
             '\n' +
-            member(`${name}Select`, 'select', `${name}Select`) +
+            member(d, `${name}Select`, 'select', `${name}Select`) +
             '\n' +
-            member(`${name}OrderBy`, 'orderBy', `${name}OrderBy`) +
+            member(d, `${name}OrderBy`, 'orderBy', `${name}OrderBy`) +
             '\n' +
-            member('PageOptions', 'options', 'PageOptions') +
+            member(d, 'PageOptions', 'options', 'PageOptions') +
             '}\n',
-        `@classType()\nexport class ${name}RemoveBulkArgs {\n` +
-            member(`${name}Where`, 'where', `${name}Where`, false) +
+        `${d.classType()}export class ${name}RemoveBulkArgs {\n` +
+            member(d, `${name}Where`, 'where', `${name}Where`, false) +
             '}\n',
-        `@classType()\nexport class ${name}Page {\n` +
-            member(`Array<${name}>`, 'items', `${name}[]`, false) +
+        `${d.classType()}export class ${name}Page {\n` +
+            member(d, `Array<${name}>`, 'items', `${name}[]`, false) +
             '\n' +
-            member('number', 'total', 'number | null') +
+            member(d, 'number', 'total', 'number | null') +
             '}\n',
     ].join('\n');
 }
@@ -366,10 +367,12 @@ function argClasses(name: string): string {
  * Emit the RPC query, input and argument classes for a contract.
  *
  * @remarks
- * These are the shapes a caller sends over the queue, and they have to be
- * decorated classes rather than types: `@classType`/`@property` are what the
- * client generator reads, and an undecorated type is dropped from the client
- * with no error at generation time.
+ * These are the shapes a caller sends over the queue, and for an @imqueue
+ * service they have to be decorated classes rather than types:
+ * `@classType`/`@property` are what the client generator reads, and an
+ * undecorated type is dropped from the client with no error at generation
+ * time. With `decorators: false` they are plain classes, for a service that
+ * is not an @imqueue service; validation rules are then not emitted either.
  *
  * Validation is the one thing not derivable from the contract — see
  * `validation`.
@@ -384,7 +387,9 @@ export function emitRpcTypes({
     imports = {},
     fields: stampFields = {},
     omit = [],
+    decorators = true,
 }: EmitRpcOptions): string {
+    const d = decorations(decorators);
     const { models, enums, columnsOf } = namespaceOf(
         contract as EmitContract,
         namespace,
@@ -429,10 +434,11 @@ export function emitRpcTypes({
         );
 
         return [
-            whereClass(name, model, fields),
-            selectClass(name, model),
-            orderByClass(name, model),
+            whereClass(d, name, model, fields),
+            selectClass(d, name, model),
+            orderByClass(d, name, model),
             inputClass(
+                d,
                 name,
                 'Create',
                 model,
@@ -441,6 +447,7 @@ export function emitRpcTypes({
                 supplied,
             ),
             inputClass(
+                d,
                 name,
                 'Update',
                 model,
@@ -448,7 +455,7 @@ export function emitRpcTypes({
                 validation[name] ?? {},
                 supplied,
             ),
-            argClasses(name),
+            argClasses(d, name),
         ].join('\n');
     });
 
@@ -462,7 +469,7 @@ export function emitRpcTypes({
         ),
     ]
         .sort()
-        .map(nestedClass);
+        .map(child => nestedClass(d, child));
 
     const repositories =
         "/** Every model's repository, so an access is total rather than " +
@@ -477,7 +484,7 @@ export function emitRpcTypes({
         '\n}\n';
 
     const emitted =
-        `${SHARED}\n${repositories}\n${nestedClasses.join('\n')}\n` +
+        `${shared(d)}\n${repositories}\n${nestedClasses.join('\n')}\n` +
         `${body.join('\n')}`;
     /* `JsonValue` is declared beside the classes, so this file takes it from
        there rather than restating a type two files would then have to agree
@@ -488,7 +495,12 @@ export function emitRpcTypes({
     ].sort();
 
     return (
-        `${emitImports(['rpc', 'validation', 'zod', 'repository'], imports)}` +
+        `${emitImports(
+            d.enabled
+                ? ['rpc', 'validation', 'zod', 'repository']
+                : ['repository'],
+            imports,
+        )}` +
         `import type {\n${named
             .map(name => `    ${name},`)
             .join('\n')}\n} from './models.js';\n\n` +

@@ -221,3 +221,26 @@ test('and is left out where nothing does', () => {
 
     assert.doesNotMatch(plain, /JsonValue/u);
 });
+
+test('without decorators a model is a plain class, importing nothing', () => {
+    const plain = emitModels({
+        contract: {
+            domain: {
+                namespaces: {
+                    public: {
+                        models: {
+                            Thing: {
+                                fields: {
+                                    id: { type: { codecId: 'pg/text@1' } },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        decorators: false,
+    });
+
+    assert.equal(plain, 'export class Thing {\n    id?: string;\n}\n');
+});

@@ -90,6 +90,10 @@ service's integration suite, not here.
   `#prisma`, RPC decorators from `@imqueue/rpc`, and validation decorators from
   `@imqueue/validation`. Keep those import strings stable — they are the
   generator's output contract.
+- **`decorators: false` emits plain classes.** Every decorator comes from
+  `src/emit/decorations.ts`, which returns empty strings when they are off; a
+  decorator written inline elsewhere would survive the option. With it on, the
+  output must stay byte-identical to what it was before the option existed.
 - **Filter the whole statement, never just its root.** Prisma Next compiles a
   relation read into one statement holding several selects. A predicate applied
   only to the outermost `from` returns the rows it was meant to exclude,
