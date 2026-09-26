@@ -38,7 +38,7 @@ jobs:
       tag: ${{ inputs.tag || '' }}
       dry-run: ${{ inputs.dry-run || false }}
       blurb: >-
-        `@imqueue/pg-prisma` — Prisma/Postgres toolkit for Node.js & TypeScript microservices —
-        query extensions (soft-delete, audit, authorship, access-scope), row archiving,
-        change-notify triggers, down-migrations, and a Prisma generator for typed @imqueue/rpc
-        models. Part of the @imqueue framework for Node.js & TypeScript microservices.
+        `@imqueue/pg-prisma` — Prisma Next (8.x) / Postgres toolkit for Node.js & TypeScript
+        microservices — query middlewares (soft-delete, authorship, audit, access-scope)
+        derived from the emitted contract, row archiving and change-notify triggers. Part of
+        the @imqueue framework for Node.js & TypeScript microservices.
