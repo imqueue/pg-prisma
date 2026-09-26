@@ -74,8 +74,15 @@ export interface TypeParsers {
  * A connection pool whose JSON columns can be read.
  *
  * @remarks
- * Registers the parsers {@link JSON_TYPES} explains, and guards the pool with
- * {@link survivesLostConnections}.
+ * Tells `node-postgres` to leave `json` and `jsonb` columns as text, and guards
+ * the pool with {@link survivesLostConnections}.
+ *
+ * **JSON is parsed once, by the ORM.** Its codec parses what it is handed, and
+ * `node-postgres` would have parsed it already. An object survives the second
+ * parse; a JSON **string** does not — `JSON.parse('Payment')` throws, and a
+ * column holding `"5"` quietly comes back as the number `5`. `json[]` and
+ * `jsonb[]` need nothing: the runtime reads every built-in array as raw text
+ * itself.
  *
  * **Arrays of enums are the runtime's own.** An enum's array type is numbered
  * when the enum is created, so `node-postgres` cannot know it and hands the

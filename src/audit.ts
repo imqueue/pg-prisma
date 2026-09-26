@@ -137,7 +137,8 @@ interface Plan {
  * The actor is resolved at the **first row**, inside the statement's own async
  * context, for the same reason.
  *
- * Call {@link close} when shutting down, or the pool keeps the process alive.
+ * Call `close()` on the returned middleware when shutting down, or the pool
+ * keeps the process alive.
  *
  * @param input - The trail's connection, table config, tables and actor.
  * @returns Middleware with a `close()` for teardown.
