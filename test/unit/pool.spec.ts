@@ -61,3 +61,25 @@ test('dataPool is guarded', async t => {
     assert.doesNotThrow(() => pool.emit('error', terminated));
     await pool.end();
 });
+
+test('dataPool leaves JSON as text and nothing else', async t => {
+    const report = mock.method(console, 'error', () => undefined);
+    const registered = new Map<number, unknown>();
+    const pool = dataPool(
+        {},
+        { setTypeParser: (oid, parser) => registered.set(oid, parser) },
+    );
+
+    t.after(() => report.mock.restore());
+
+    /* json and jsonb only. Arrays — of JSON, of enums, of anything — are the
+       runtime's to decode from raw text, and a parser here would hand it an
+       array it refuses. */
+    assert.deepEqual([...registered.keys()], [114, 3802]);
+
+    for (const parser of registered.values()) {
+        assert.equal((parser as (value: string) => string)('"5"'), '"5"');
+    }
+
+    await pool.end();
+});

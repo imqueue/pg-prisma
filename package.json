@@ -52,10 +52,10 @@
     "pg": "^8.23.0"
   },
   "peerDependencies": {
-    "@prisma/orm-postgres": ">=8.0.0-rc.9"
+    "@prisma/orm-postgres": ">=8.0.0-rc.12"
   },
   "devDependencies": {
-    "@prisma/orm-postgres": "^8.0.0-rc.9",
+    "@prisma/orm-postgres": "^8.0.0-rc.12",
     "@types/node": "^26.4.0",
     "@types/pg": "^8.23.1",
     "oxfmt": "^0.67.0",

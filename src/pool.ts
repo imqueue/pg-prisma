@@ -1,5 +1,5 @@
 /*!
- * @imqueue/pg-prisma — a pool that can read an array of enums
+ * @imqueue/pg-prisma — a pool that can read JSON columns
  *
  * I'm Queue Software Project
  * Copyright (C) 2026  imqueue.com <support@imqueue.com>
@@ -23,7 +23,7 @@
  */
 
 import pg from 'pg';
-import type { Pool, PoolConfig, PoolClient } from 'pg';
+import type { Pool, PoolConfig } from 'pg';
 
 /**
  * Keep a pool's lost idle connection from ending the process.
@@ -46,11 +46,8 @@ export function survivesLostConnections<P extends Pool>(pool: P): P {
     return pool;
 }
 
-/** `text[]`, whose wire format an array of enums shares exactly. */
-const TEXT_ARRAY = 1009;
-
 /**
- * `json`, `jsonb`, and their array forms.
+ * `json` and `jsonb`.
  *
  * @remarks
  * The ORM's codec parses what it is handed — `wire => typeof wire === 'string'
@@ -62,53 +59,39 @@ const TEXT_ARRAY = 1009;
  * second parse succeeds and quietly changes the type.
  *
  * So the driver is told to leave these alone and let the codec do the one
- * parse it means to do.
+ * parse it means to do. Their array forms, `json[]` and `jsonb[]`, are not
+ * here: the runtime reads every built-in array as raw text itself and never
+ * asks this registry about them.
  */
-const JSON_TYPES = [114, 3802, 199, 3807];
+const JSON_TYPES = [114, 3802];
 
-/** Every enum type's array companion, as this database numbers them. */
-const ENUM_ARRAY_OIDS =
-    "SELECT typarray FROM pg_type WHERE typtype = 'e' AND typarray <> 0";
-
-/** What `pg-types` offers, of which only these two are wanted. */
+/** What `pg-types` offers, of which only this one is wanted. */
 export interface TypeParsers {
-    getTypeParser: (oid: number, format?: string) => unknown;
     setTypeParser: (oid: number, parser: unknown) => void;
 }
 
 /**
- * A connection pool whose arrays of enums and JSON columns can be read.
+ * A connection pool whose JSON columns can be read.
  *
  * @remarks
- * `node-postgres` parses a value by its type's oid, and it knows only the
- * built-in ones. An enum is numbered when it is created, so its array type is
- * numbered too, and neither number can be known ahead of time — the driver
- * therefore hands back the literal text `{EMAIL,SMS}` where the ORM requires
- * an array, and every read of the column fails with `RUNTIME.DECODE_FAILED`.
- * A scalar enum is unaffected, because its text *is* its value.
+ * Registers the parsers {@link JSON_TYPES} explains, and guards the pool with
+ * {@link survivesLostConnections}.
  *
- * So the oids are asked for, once, and those columns are parsed the way a
- * `text[]` is — which is what an array of enums is on the wire. The JSON
- * types are corrected at the same time, for the reason on {@link JSON_TYPES}.
- *
- * The lookup is deferred to the first connection rather than done here,
- * because a pool is built where a client is built and that is not a place
- * where anything can be awaited. It runs once; a query that arrives while it
- * is in flight waits for it rather than starting a second one.
+ * **Arrays of enums are the runtime's own.** An enum's array type is numbered
+ * when the enum is created, so `node-postgres` cannot know it and hands the
+ * literal text `{EMAIL,SMS}` back. Prisma Next up to 8.0.0-rc.11 could not
+ * read that, and this pool used to parse it into an array first. From
+ * 8.0.0-rc.12 the runtime decodes that text itself and refuses anything
+ * already parsed — `RUNTIME.DECODE_FAILED`, "expected raw text for a Postgres
+ * array" — so the text is now left exactly as the driver gives it.
  *
  * The registry is the one the *runtime* reads, not the one a pool carries:
  * the ORM passes its own `types` to every query, and that object falls
  * through to `pg-types` for anything it does not handle itself. A parser set
- * on the pool is therefore never consulted.
- *
- * Three things follow from the registry being global. A raw `pg` query in the
- * same process reads a JSON column as text and has to parse it itself, which
- * is the trade for the ORM reading it correctly. An enum type created
- * *after* the first connection is not picked up — which is a migration
- * applied to a running process, and migrations run at start, before anything
- * connects. And a process holding pools onto two different databases would
- * have them share one numbering, which no service here does: a service owns
- * one database.
+ * on the pool is therefore never consulted. It follows that the registry is
+ * global, and a raw `pg` query in the same process reads a JSON column as
+ * text and has to parse it itself — the trade for the ORM reading it
+ * correctly.
  *
  * @param config - Pool configuration, as `pg` takes it.
  * @param parsers - The registry to register in. Defaults to this package's
@@ -128,59 +111,11 @@ export function dataPool(
     config: PoolConfig,
     parsers: TypeParsers = pg.types as unknown as TypeParsers,
 ): Pool {
-    const pool = survivesLostConnections(new pg.Pool(config));
+    const asIs = (value: string): string => value;
 
-    // Bound before the override, so neither the lookup below nor the callback
-    // form calls itself.
-    const connect = pool.connect.bind(pool) as {
-        (): Promise<PoolClient>;
-        (callback: (error: unknown, client?: unknown) => void): void;
-    };
-    const once: { lookup?: Promise<void> } = {};
+    for (const oid of JSON_TYPES) {
+        parsers.setTypeParser(oid, asIs);
+    }
 
-    const lookup = async (): Promise<void> => {
-        const asTextArray = parsers.getTypeParser(TEXT_ARRAY);
-        const asIs = (value: string): string => value;
-        const client = await connect();
-
-        for (const oid of JSON_TYPES) {
-            parsers.setTypeParser(
-                oid,
-                oid === 199 || oid === 3807 ? asTextArray : asIs,
-            );
-        }
-
-        try {
-            const { rows } = await client.query<{ typarray: string }>(
-                ENUM_ARRAY_OIDS,
-            );
-
-            for (const row of rows) {
-                parsers.setTypeParser(Number(row.typarray), asTextArray);
-            }
-        } finally {
-            client.release();
-        }
-    };
-
-    // `Pool.query` calls `connect` with a callback, so both forms are served.
-    pool.connect = ((callback?: unknown) => {
-        once.lookup ??= lookup();
-
-        if (typeof callback !== 'function') {
-            return once.lookup.then(() => connect());
-        }
-
-        const done = callback as (error: unknown, client?: unknown) => void;
-
-        once.lookup
-            .then(() => connect(done))
-            .catch((error: unknown) => {
-                done(error);
-            });
-
-        return undefined;
-    }) as typeof pool.connect;
-
-    return pool;
+    return survivesLostConnections(new pg.Pool(config));
 }
