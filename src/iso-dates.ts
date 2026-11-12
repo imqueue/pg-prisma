@@ -126,7 +126,15 @@ export function isoDates({ columns }: IsoDateOptions): SqlMiddleware {
             return;
         }
 
-        if (!node || typeof node !== 'object') {
+        // A `bytea` arrives as a Buffer, whose every byte `Object.entries`
+        // would hand back as a pair: a 9 MB file cost two seconds here, and
+        // no byte is ever a timestamp.
+        if (
+            !node ||
+            typeof node !== 'object' ||
+            ArrayBuffer.isView(node) ||
+            node instanceof ArrayBuffer
+        ) {
             return;
         }
 

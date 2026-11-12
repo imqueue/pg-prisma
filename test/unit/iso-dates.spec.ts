@@ -112,3 +112,21 @@ test('a date column holding something else is left alone', async () => {
 test('a null date is left alone', async () => {
     assert.deepEqual(await convert({ createdAt: null }), { createdAt: null });
 });
+
+// A `bytea` column arrives as a Buffer. Walked like an object, every byte was
+// a key: a 9 MB file took two seconds to read for no date at all.
+test('a byte column is not walked, and keeps its bytes', async () => {
+    const bytes = Buffer.alloc(9 * 1024 * 1024, 7);
+    const started = performance.now();
+    const row = (await convert({
+        createdAt: '2026-08-14 09:30:00+00',
+        bytes,
+        typed: new Uint8Array([1, 2, 3]),
+    })) as { createdAt: string; bytes: Buffer; typed: Uint8Array };
+
+    assert.ok(performance.now() - started < 50);
+    assert.equal(row.createdAt, '2026-08-14T09:30:00.000Z');
+    assert.equal(row.bytes, bytes);
+    assert.equal(row.bytes.length, 9 * 1024 * 1024);
+    assert.deepEqual([...row.typed], [1, 2, 3]);
+});

@@ -92,6 +92,16 @@ export interface AuditOptions {
      * first write would not terminate.
      */
     connectionString: string;
+    /**
+     * Settings for the trail's own pool — its size, how long an idle
+     * connection is kept, timeouts. Omitted, `pg`'s defaults apply.
+     *
+     * @remarks
+     * The trail writes once per audited statement, so it wants about as many
+     * connections as the client it audits; `pg`'s default of ten is more than
+     * a deliberately small data pool and doubles what one process holds.
+     */
+    pool?: Omit<pg.PoolConfig, 'connectionString'>;
     /** Where the trail goes. Omitted entirely, the defaults apply. */
     config?: AuditConfig;
     /** Physical table to model name, for the tables that are recorded. */
@@ -145,12 +155,15 @@ interface Plan {
  */
 export function audit({
     connectionString,
+    pool: settings = {},
     config = {},
     tables,
     stamps = {},
     getPrincipal,
 }: AuditOptions): SqlMiddleware & { close(): Promise<void> } {
-    const pool = survivesLostConnections(new pg.Pool({ connectionString }));
+    const pool = survivesLostConnections(
+        new pg.Pool({ ...settings, connectionString }),
+    );
     const table = config.table ?? DEFAULTS.table;
     const col = { ...DEFAULTS.columns, ...config.columns };
     const pending = new WeakMap<object, Batch>();
