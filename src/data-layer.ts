@@ -24,7 +24,7 @@
 
 import { isoDates } from './iso-dates.js';
 import { type AccessScopeResolver, accessScope } from './access-scope.js';
-import { type AuditConfig, audit } from './audit.js';
+import { type AuditConfig, type AuditOptions, audit } from './audit.js';
 import type { SqlMiddleware } from '@prisma/orm-postgres/family-runtime';
 import {
     type DerivedDataLayer,
@@ -38,6 +38,8 @@ import { stamp } from './stamp.js';
 export interface DataLayerAudit {
     /** Connection string for the trail's own pool. */
     connectionString: string;
+    /** Settings for the trail's own pool. Omitted, `pg`'s defaults. */
+    pool?: AuditOptions['pool'];
     /** Where the trail goes. Omitted, the conventional table and columns. */
     config?: AuditConfig;
     /** Resolves the actor to record, or a falsy value to record none. */
@@ -110,6 +112,7 @@ export function dataLayer(options: DataLayerOptions): DataLayer {
     const recorded = options.audit
         ? audit({
               connectionString: options.audit.connectionString,
+              ...(options.audit.pool ? { pool: options.audit.pool } : {}),
               ...(options.audit.config ? { config: options.audit.config } : {}),
               getPrincipal: options.audit.getPrincipal,
               stamps: derived.stamps,
