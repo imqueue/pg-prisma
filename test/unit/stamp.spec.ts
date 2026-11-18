@@ -166,3 +166,16 @@ test('soft-deleting through an update does stamp deletedBy', async () => {
         'updatedBy',
     ]);
 });
+
+// A single-row update is one `UPDATE … RETURNING`, with no read before it to
+// skip a row deleted already, so the update has to skip it itself.
+test('soft-deleting through an update leaves a deleted row alone', async () => {
+    const out = await run(
+        UpdateAst.table(TableSource.named('Session'))
+            .withSet({
+                deletedAt: { kind: 'param-ref', value: '2026-01-01' } as never,
+            })
+            .withWhere(ColumnRef.of('Session', 'id') as never),
+    );
+    assert.deepEqual(columns(out?.where), ['id', 'deletedAt']);
+});

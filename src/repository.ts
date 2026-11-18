@@ -156,6 +156,7 @@ interface Collection {
     first(): Promise<unknown>;
     create(input: object): Promise<unknown>;
     update(input: object): Promise<unknown>;
+    updateAll(input: object): PromiseLike<unknown[]>;
     createAll(rows: readonly object[]): Promise<unknown[]>;
     upsert(args: {
         create: object;
@@ -258,6 +259,13 @@ export function repositoriesFor<
 
             return predicate ? collection().where(predicate) : collection();
         };
+        // Counted on the filter alone, so the middleware rewrites it as it
+        // would a read: a count that ignored the soft-delete filter or the
+        // access scope would answer about rows the caller cannot read.
+        const total = (where?: Where): Promise<number> =>
+            filtered(where)
+                .aggregate(a => ({ total: a.count() }))
+                .then(row => row.total ?? 0);
 
         // A write returns every column unless it is told otherwise, so a
         // `select` that is dropped here hands the caller whatever the row
@@ -291,16 +299,7 @@ export function repositoriesFor<
 
         return {
             async count(args: { where?: Where | undefined }): Promise<number> {
-                // Through `list` rather than the ORM's own `count`, so the
-                // middleware sees the same query shape a read would — a
-                // count that ignored the soft-delete filter or the access
-                // scope would answer about rows the caller cannot read.
-                const { total } = await this.list<unknown>({
-                    ...args,
-                    options: { take: 0, withTotal: true },
-                });
-
-                return total ?? 0;
+                return total(args.where);
             },
             async createBulk<Entity>(args: {
                 input: readonly object[];
@@ -389,9 +388,26 @@ export function repositoriesFor<
                 select?: Select | undefined;
             }): Promise<Entity> {
                 const { id, ...data } = args.input;
+                // The ORM's `update` finds the row first and then writes it,
+                // in a transaction: four round trips. Keyed by `id`, one
+                // `UPDATE … RETURNING` says the same, and the middleware
+                // narrows it as it narrowed that read. A missing id would
+                // leave the filter empty and write every row, and a nested
+                // relation callback only `update` runs, so both keep it.
+                const single =
+                    id !== undefined &&
+                    id !== null &&
+                    !Object.values(data).some(
+                        value => typeof value === 'function',
+                    );
 
                 return (await write(
-                    query => query.where({ id }).update(data),
+                    query =>
+                        single
+                            ? Promise.resolve(
+                                  query.where({ id }).updateAll(data),
+                              ).then(rows => rows[0] ?? null)
+                            : query.where({ id }).update(data),
                     args.select,
                 )) as Entity;
             },
@@ -436,16 +452,12 @@ export function repositoriesFor<
 
                 // Counted on the filter, not on the page: the total answers
                 // "how many match", which paging must not narrow.
-                const [items, total] = await Promise.all([
+                const [items, counted] = await Promise.all([
                     paged.all() as Promise<Entity[]>,
-                    withTotal
-                        ? base
-                              .aggregate(a => ({ total: a.count() }))
-                              .then(row => row.total ?? 0)
-                        : Promise.resolve(null),
+                    withTotal ? total(args.where) : Promise.resolve(null),
                 ]);
 
-                return { items, total };
+                return { items, total: counted };
             },
             async upsert<
                 Entity,

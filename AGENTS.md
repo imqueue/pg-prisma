@@ -106,6 +106,12 @@ service's integration suite, not here.
   row. A shared buffer lets one statement flush another's rows under the wrong
   actor — the worst failure a security trail has. Key by the plan object, and
   resolve the actor at the first row, inside that statement's async context.
+- **An update by id is one statement.** `Repository.update` sends a single
+  `UPDATE … RETURNING` rather than the ORM's `update` (a transaction around a
+  read and a write), so the middleware must narrow an `UPDATE` exactly as it
+  narrows the read it replaced: soft-delete and access scope both filter
+  updates. `test/unit/repository.spec.ts` counts the statements against the
+  real client and a recording pool.
 - **`silently()` flips a shared module flag** — it is for pre-request one-offs
   (startup DDL), not interleaved concurrent traffic.
 
