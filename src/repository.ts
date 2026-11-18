@@ -22,6 +22,7 @@
  * <support@imqueue.com> to get commercial licensing options.
  */
 
+import { auditedWith } from './audited.js';
 import type { RelationInfo, RelationMap } from './derive.js';
 import {
     type Fields,
@@ -144,6 +145,9 @@ export interface Repository<Entity = unknown> {
     removeBulk(args: { where?: Where }): Promise<BulkCount>;
 }
 
+/** Rows a write returns: awaited whole, or streamed. */
+type Rows = PromiseLike<unknown[]> & AsyncIterable<unknown>;
+
 /** The ORM collection this façade drives. */
 interface Collection {
     where(predicate: unknown): Collection;
@@ -156,7 +160,8 @@ interface Collection {
     first(): Promise<unknown>;
     create(input: object): Promise<unknown>;
     update(input: object): Promise<unknown>;
-    updateAll(input: object): PromiseLike<unknown[]>;
+    updateAll(input: object): Rows;
+    deleteAll(): Rows;
     createAll(rows: readonly object[]): Promise<unknown[]>;
     upsert(args: {
         create: object;
@@ -176,6 +181,43 @@ export interface RepositoryOptions {
     relations: RelationMap;
     /** Namespace the models live in. Defaults to `public`. */
     namespace?: string;
+    /**
+     * Tables the audit trail records, physical table to model, as
+     * `deriveDataLayer` gives them in `audit`.
+     *
+     * @remarks
+     * A trail records a write from the rows the database returns, so a write
+     * to one of these returns its rows whole: a bulk update or delete is
+     * `… RETURNING` rather than a bare count, and a `select` narrows what the
+     * caller is given rather than what the statement returns. Every other
+     * table keeps the count alone.
+     *
+     * Omitted, it is the `audit` of the `deriveDataLayer` call `relations`
+     * came from. Pass `{}` where no trail is kept.
+     */
+    audited?: Readonly<Record<string, string>>;
+}
+
+/** Count rows as they stream, without holding them. */
+async function counted(rows: AsyncIterable<unknown>): Promise<number> {
+    let count = 0;
+
+    for await (const _row of rows) {
+        count += 1;
+    }
+
+    return count;
+}
+
+/** A written row cut down to the fields its `select` named. */
+function picked(row: unknown, fields: readonly string[]): unknown {
+    if (row === null || row === undefined) {
+        return row;
+    }
+
+    return Object.fromEntries(
+        fields.map(field => [field, (row as Record<string, unknown>)[field]]),
+    );
 }
 
 /** Apply a projection's scalar half and its relation branches. */
@@ -233,9 +275,12 @@ export function repositoriesFor<
         orm: Record<string, Record<string, Collection>>;
         transaction?: Transactional['transaction'];
     },
-    { relations, namespace = 'public' }: RepositoryOptions,
+    { relations, namespace = 'public', audited }: RepositoryOptions,
 ): Repositories {
     const models = db.orm[namespace] ?? {};
+    const recorded = new Set(
+        Object.values(audited ?? auditedWith(relations) ?? {}),
+    );
 
     // A nested create is several inserts, so it has to commit as one. Already
     // inside a transaction the client has no `transaction` of its own and the
@@ -254,6 +299,10 @@ export function repositoriesFor<
         scope: Record<string, Collection> = models,
     ): Repository => {
         const collection = (): Collection => scope[model] as Collection;
+        // The trail records what a statement returns. A bulk count returns
+        // nothing, and a narrowed RETURNING can leave out the id it keys on,
+        // so a recorded table's writes return the whole row.
+        const whole = recorded.has(model);
         const filtered = (where?: Where): Collection => {
             const predicate = toPredicate(relations, model, where);
 
@@ -282,13 +331,15 @@ export function repositoriesFor<
                 ? []
                 : (projection?.fields ?? []);
             const written = await run(
-                scalars.length > 0
+                scalars.length > 0 && !whole
                     ? collection().select(...scalars)
                     : collection(),
             );
 
             if (!projection?.includes.length) {
-                return written;
+                return scalars.length > 0 && whole
+                    ? picked(written, scalars)
+                    : written;
             }
 
             return project(
@@ -314,11 +365,17 @@ export function repositoriesFor<
                     ? []
                     : (projection?.fields ?? []);
 
-                return (await (
-                    scalars.length > 0
+                const rows = await (
+                    scalars.length > 0 && !whole
                         ? collection().select(...scalars)
                         : collection()
-                ).createAll(args.input)) as Entity[];
+                ).createAll(args.input);
+
+                return (
+                    scalars.length > 0 && whole
+                        ? rows.map(row => picked(row, scalars))
+                        : rows
+                ) as Entity[];
             },
             async create<Entity>(args: {
                 input: object;
@@ -504,14 +561,22 @@ export function repositoriesFor<
                 where?: Where;
                 input: object;
             }): Promise<BulkCount> {
+                const query = filtered(args.where);
+
                 return {
-                    count: await filtered(args.where).updateAndCount(
-                        args.input,
-                    ),
+                    count: whole
+                        ? await counted(query.updateAll(args.input))
+                        : await query.updateAndCount(args.input),
                 };
             },
             async removeBulk(args: { where?: Where }): Promise<BulkCount> {
-                return { count: await filtered(args.where).deleteAndCount() };
+                const query = filtered(args.where);
+
+                return {
+                    count: whole
+                        ? await counted(query.deleteAll())
+                        : await query.deleteAndCount(),
+                };
             },
         };
     };

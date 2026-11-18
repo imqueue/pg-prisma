@@ -95,6 +95,13 @@ export const db = postgres<Contract>({
 caller never orders them, and so cannot order them wrongly. Call
 `layer.close()` on shutdown to release the audit pool.
 
+The trail records a write from the rows the database returns. So
+`repositoriesFor(db, { relations: layer.derived.relations })` makes every write
+to a recorded table return its rows whole: `removeBulk` and `updateBulk` send
+`… RETURNING` instead of a bare count, and a `select` narrows what the caller
+gets back, not what the trail sees. Tables in `auditExclude` keep the bare
+count. Without a trail at all, pass `audited: {}` to keep it everywhere.
+
 ## Access scope
 
 Scope is the one thing that cannot be derived from the contract — Prisma Next

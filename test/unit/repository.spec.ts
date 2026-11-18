@@ -32,12 +32,8 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import postgres from '@prisma/orm-postgres/runtime';
-import {
-    type Repository,
-    dataLayer,
-    deriveDataLayer,
-    repositoriesFor,
-} from '../../index.js';
+import pg from 'pg';
+import { type Repository, dataLayer, repositoriesFor } from '../../index.js';
 
 const contract = JSON.parse(
     readFileSync(new URL('../fixture/contract.json', import.meta.url), 'utf8'),
@@ -60,7 +56,54 @@ const answers =
     text =>
         text.startsWith('SELECT COUNT(*)') ? [{ total: 3 }] : rows;
 
-function recorded(answer: Answer = answers()) {
+/** One row of the audit trail, as `audit` inserted it. */
+interface Trailed {
+    action: string;
+    recordId: string;
+    changes: Record<string, unknown>;
+}
+
+/**
+ * How the harness is built. With no trail, `Note` is left out of it, as a
+ * table nothing records; `hard` makes its deletes real ones.
+ */
+interface How {
+    trail?: boolean;
+    hard?: boolean;
+    audited?: Record<string, string>;
+}
+
+/** The real `audit`, its pool swapped for one that keeps what it inserts. */
+function trailOf(build: () => ReturnType<typeof dataLayer>) {
+    const trail: Trailed[] = [];
+    const Pool = pg.Pool;
+
+    pg.Pool = class {
+        on(): this {
+            return this;
+        }
+        async end(): Promise<void> {}
+        async query(_text: string, values: unknown[]) {
+            for (let at = 0; at + 4 < values.length; at += 4) {
+                trail.push({
+                    action: values[at] as string,
+                    recordId: values[at + 2] as string,
+                    changes: JSON.parse(values[at + 3] as string),
+                });
+            }
+
+            return { rows: [], rowCount: 0 };
+        }
+    } as never;
+
+    try {
+        return { layer: build(), trail };
+    } finally {
+        pg.Pool = Pool;
+    }
+}
+
+function recorded(answer: Answer = answers(), how: How = {}) {
     const sent: string[] = [];
     const query = async (input: unknown) => {
         const text =
@@ -89,25 +132,38 @@ function recorded(answer: Answer = answers()) {
         on: () => pool,
         end: async () => undefined,
     };
-    const layer = dataLayer({
-        contract,
-        scope: { Note: { owner: ['ownerId'] } },
-        resolvers: { owner: () => 'u-1' },
-        getActorId: () => null,
-    });
+    const { layer, trail } = trailOf(() =>
+        dataLayer({
+            contract,
+            scope: { Note: { owner: ['ownerId'] } },
+            resolvers: { owner: () => 'u-1' },
+            getActorId: () => null,
+            ...(how.hard ? { fields: { deletedAt: 'removedAt' } } : {}),
+            ...(how.trail
+                ? {
+                      audit: {
+                          connectionString: 'postgresql://trail@localhost/none',
+                          getPrincipal: () => ({ id: 'u-1' }),
+                      },
+                  }
+                : { auditExclude: ['Note'] }),
+        }),
+    );
     const db = postgres({
         contractJson: contract,
         pg: pool,
         verifyMarker: false,
         middleware: layer.middleware,
     } as never);
-    const { relations } = deriveDataLayer({ contract });
     const repository = repositoriesFor<{ note: Repository<Note> }>(
         db as never,
-        { relations },
+        {
+            relations: layer.derived.relations,
+            ...(how.audited ? { audited: how.audited } : {}),
+        },
     );
 
-    return { repository: repository.note, sent };
+    return { repository: repository.note, sent, trail };
 }
 
 test('an update by id is one statement', async () => {
@@ -194,4 +250,167 @@ test('a page with its total is the page and the count', async () => {
 
     assert.deepEqual(page, { items: [NOTE], total: 3 });
     assert.equal(sent.length, 2, sent.join('\n'));
+});
+
+const NOTES: Note[] = [NOTE, { ...NOTE, id: 'n-2', title: 'c' }];
+
+// A trail records what a statement returns, and a bare count returns nothing:
+// a bulk delete or update left no row in the trail at all.
+test('a bulk delete of a recorded table is in the trail, row by row', async () => {
+    const { repository, sent, trail } = recorded(answers(NOTES), {
+        trail: true,
+        hard: true,
+    });
+
+    const removed = await repository.removeBulk({
+        where: { title: { eq: 'b' } },
+    });
+
+    assert.deepEqual(removed, { count: 2 });
+    assert.equal(sent.length, 1, sent.join('\n'));
+    assert.match(sent[0] as string, /^DELETE FROM "public"\."Note"/);
+    assert.match(sent[0] as string, / RETURNING /);
+    assert.deepEqual(
+        trail.map(row => [row.action, row.recordId]),
+        [
+            ['DELETE', 'n-1'],
+            ['DELETE', 'n-2'],
+        ],
+    );
+    assert.deepEqual(trail[0]?.changes, { ...NOTE });
+});
+
+test('a soft bulk delete is in the trail as a delete, row by row', async () => {
+    const { repository, sent, trail } = recorded(answers(NOTES), {
+        trail: true,
+    });
+
+    const removed = await repository.removeBulk({
+        where: { title: { eq: 'b' } },
+    });
+
+    assert.deepEqual(removed, { count: 2 });
+    assert.equal(sent.length, 1, sent.join('\n'));
+    assert.match(sent[0] as string, /^UPDATE "public"\."Note" SET "deletedAt"/);
+    assert.match(sent[0] as string, / RETURNING /);
+    assert.deepEqual(
+        trail.map(row => [row.action, row.recordId]),
+        [
+            ['DELETE', 'n-1'],
+            ['DELETE', 'n-2'],
+        ],
+    );
+});
+
+test('a bulk update of a recorded table is in the trail, row by row', async () => {
+    const { repository, sent, trail } = recorded(answers(NOTES), {
+        trail: true,
+    });
+
+    const updated = await repository.updateBulk({
+        where: { ownerId: { eq: 'u-1' } },
+        input: { title: 'b' },
+    });
+
+    assert.deepEqual(updated, { count: 2 });
+    assert.equal(sent.length, 1, sent.join('\n'));
+    assert.match(sent[0] as string, /^UPDATE "public"\."Note" SET "title"/);
+    assert.match(sent[0] as string, / RETURNING /);
+    assert.deepEqual(
+        trail.map(row => [row.action, row.recordId]),
+        [
+            ['UPDATE', 'n-1'],
+            ['UPDATE', 'n-2'],
+        ],
+    );
+});
+
+test('a table the trail leaves out keeps the bare count', async () => {
+    const { repository, sent } = recorded(answers(NOTES), { hard: true });
+
+    assert.deepEqual(await repository.removeBulk({}), { count: 2 });
+    assert.deepEqual(await repository.updateBulk({ input: { title: 'b' } }), {
+        count: 2,
+    });
+    assert.equal(sent.length, 2, sent.join('\n'));
+    assert.match(sent[0] as string, /^DELETE FROM "public"\."Note"/);
+    assert.match(sent[1] as string, /^UPDATE "public"\."Note" SET/);
+
+    for (const text of sent) {
+        assert.doesNotMatch(text, /RETURNING/);
+    }
+});
+
+test('a layer told nothing is recorded keeps the bare count', async () => {
+    const { repository, sent } = recorded(answers(NOTES), {
+        trail: true,
+        audited: {},
+    });
+
+    await repository.removeBulk({});
+    await repository.updateBulk({ input: { title: 'b' } });
+
+    for (const text of sent) {
+        assert.doesNotMatch(text, /RETURNING/);
+    }
+});
+
+// A select narrowed the RETURNING, so a select without the id left the trail
+// nothing to key a row on, and one with it left the trail part of the row.
+test('a bulk create with a select still hands the trail every row whole', async () => {
+    const { repository, sent, trail } = recorded(answers(NOTES), {
+        trail: true,
+    });
+
+    const created = await repository.createBulk<{ title: string }>({
+        input: NOTES.map(({ id, title, ownerId }) => ({ id, title, ownerId })),
+        select: { title: true },
+    });
+
+    assert.deepEqual(created, [{ title: 'b' }, { title: 'c' }]);
+    assert.equal(sent.length, 1, sent.join('\n'));
+    assert.match(sent[0] as string, /RETURNING .*"id".*"ownerId"/);
+    assert.deepEqual(
+        trail.map(row => [row.action, row.recordId]),
+        [
+            ['INSERT', 'n-1'],
+            ['INSERT', 'n-2'],
+        ],
+    );
+    assert.deepEqual(trail[0]?.changes, { ...NOTE });
+});
+
+test('an upsert with a select still hands the trail the row whole', async () => {
+    const { repository, sent, trail } = recorded(answers(), { trail: true });
+
+    const upserted = await repository.upsert<{ title: string }>({
+        input: { id: 'n-1', title: 'b', ownerId: 'u-1' },
+        select: { title: true },
+    });
+
+    assert.deepEqual(upserted, { title: 'b' });
+    assert.match(sent[0] as string, /RETURNING .*"id".*"ownerId"/);
+    assert.deepEqual(
+        trail.map(row => [row.recordId, row.changes]),
+        [['n-1', { ...NOTE }]],
+    );
+});
+
+test('an update with a select still hands the trail the row whole', async () => {
+    const { repository, sent, trail } = recorded(answers(), { trail: true });
+
+    const updated = await repository.update<
+        { title: string },
+        { id: string; title: string }
+    >({
+        input: { id: 'n-1', title: 'b' },
+        select: { title: true },
+    });
+
+    assert.deepEqual(updated, { title: 'b' });
+    assert.match(sent[0] as string, /RETURNING .*"id".*"ownerId"/);
+    assert.deepEqual(
+        trail.map(row => [row.action, row.recordId, row.changes]),
+        [['UPDATE', 'n-1', { ...NOTE }]],
+    );
 });
