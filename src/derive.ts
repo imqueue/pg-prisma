@@ -22,6 +22,7 @@
  * <support@imqueue.com> to get commercial licensing options.
  */
 
+import { noteAudited } from './audited.js';
 import { TIMESTAMP_CODECS } from './iso-dates.js';
 
 /** The slice of an emitted `contract.json` this derivation reads. */
@@ -294,6 +295,18 @@ export function deriveDataLayer({
                 : {}),
         };
     };
+    const audit = Object.fromEntries(
+        entries
+            .filter(entry => !excluded.has(entry.model))
+            .map(entry => [entry.table, entry.model]),
+    );
+    const relations: RelationMap = Object.fromEntries(
+        entries
+            .filter(entry => Object.keys(entry.relations).length > 0)
+            .map(entry => [entry.model, entry.relations]),
+    );
+
+    noteAudited(relations, audit);
 
     return {
         dates: new Set(
@@ -310,11 +323,7 @@ export function deriveDataLayer({
                 .map(entry => [entry.table, stamped(entry)] as const)
                 .filter(([, columns]) => Object.keys(columns).length > 0),
         ),
-        audit: Object.fromEntries(
-            entries
-                .filter(entry => !excluded.has(entry.model))
-                .map(entry => [entry.table, entry.model]),
-        ),
+        audit,
         scope: Object.fromEntries(
             Object.entries(scope).map(([model, levels]) => [
                 byModel.get(model)?.table ?? model,
@@ -328,10 +337,6 @@ export function deriveDataLayer({
                 ),
             ]),
         ),
-        relations: Object.fromEntries(
-            entries
-                .filter(entry => Object.keys(entry.relations).length > 0)
-                .map(entry => [entry.model, entry.relations]),
-        ),
+        relations,
     };
 }

@@ -73,6 +73,7 @@ service's integration suite, not here.
 | `src/stamp.ts` | Soft-delete and authorship, as one middleware. |
 | `src/access-scope.ts` | Row-level access-scope middleware. |
 | `src/audit.ts` | Audit-trail middleware, writing through its own pool. |
+| `src/audited.ts` | Internal: the tables a derivation records, keyed by its relation map. |
 | `src/archive.ts` | Row-archiving installer (aged rows → mirror `archive` schema, pg_cron). |
 | `src/change-notify.ts` | Postgres row-change `NOTIFY` trigger installer. |
 | `src/pretty-sql.ts` | `prettifySql()` SQL pretty-printer for query logging. |
@@ -112,6 +113,13 @@ service's integration suite, not here.
   narrows the read it replaced: soft-delete and access scope both filter
   updates. `test/unit/repository.spec.ts` counts the statements against the
   real client and a recording pool.
+- **A trail sees only rows a statement returns.** A bulk count (`deleteAndCount`,
+  `updateAndCount`) returns none, and a `select` narrows `RETURNING`, so on a
+  recorded table `Repository` sends `… RETURNING` with the whole row and cuts
+  the result down to the `select` itself. Other tables keep the bare count.
+  `repositoriesFor` learns which tables are recorded from the `relations` map
+  `deriveDataLayer` returned (`src/audited.ts`), because callers pass that map
+  alone; `audited` overrides it.
 - **`silently()` flips a shared module flag** — it is for pre-request one-offs
   (startup DDL), not interleaved concurrent traffic.
 
