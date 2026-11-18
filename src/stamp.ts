@@ -165,6 +165,9 @@ export function stamp({ tables, getActorId }: StampOptions): SqlMiddleware {
                 // deletion. Setting it to null is a restore, and stamping
                 // `deletedBy` there would name whoever brought the row back.
                 const deleting = setsValue(ast.set, columns.deletedAt);
+                // Every update skips a row deleted already, a soft delete as
+                // well, as a rewritten DELETE does: stamping that row again
+                // would overwrite who deleted it, and when.
                 const alive = columns.deletedAt
                     ? isNull(qualifierOf(ast.table), columns.deletedAt)
                     : undefined;
@@ -174,9 +177,7 @@ export function stamp({ tables, getActorId }: StampOptions): SqlMiddleware {
                     ast: ast
                         .withSet({ ...ast.set, ...authored(columns, deleting) })
                         .withWhere(
-                            alive && !deleting
-                                ? conjoin(ast.where, alive)
-                                : ast.where,
+                            alive ? conjoin(ast.where, alive) : ast.where,
                         ),
                 };
             }
