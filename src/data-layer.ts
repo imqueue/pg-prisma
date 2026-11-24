@@ -44,6 +44,12 @@ export interface DataLayerAudit {
     config?: AuditConfig;
     /** Resolves the actor to record, or a falsy value to record none. */
     getPrincipal: () => unknown;
+    /**
+     * Told when the trail could not record a write as it should. Omitted,
+     * `console.error`, plus the runtime's `ctx.log.warn` when it has one.
+     * See {@link AuditOptions.onError}.
+     */
+    onError?: AuditOptions['onError'];
 }
 
 /** Everything {@link dataLayer} needs. */
@@ -72,6 +78,23 @@ export interface DataLayer {
     derived: DerivedDataLayer;
     /** Releases the audit pool. A no-op when nothing is recorded. */
     close(): Promise<void>;
+    /**
+     * The client `postgres()` built over {@link DataLayer.middleware}, with
+     * its transactions known to the trail.
+     *
+     * @remarks
+     * The middleware is told that a statement ran in a transaction, but not
+     * whether that transaction went on to commit. A bound client's
+     * `transaction` records the writes made inside it once COMMIT succeeds
+     * and drops them when it rolls back. Unbound, such a write is recorded as
+     * soon as its statement completes, rollback or not, and the trail says
+     * so once through `onError`. Without a trail the client is returned
+     * as it is. See {@link audit} for the transactions this cannot see.
+     *
+     * @param client - The client, as returned by `postgres()`.
+     * @returns The same client, its `transaction` wrapped.
+     */
+    bind<Client extends object>(client: Client): Client;
 }
 
 /**
@@ -89,7 +112,7 @@ export interface DataLayer {
  * cover; for the ordinary case this is the entry point.
  *
  * @param options - The contract, what cannot be derived, and the resolvers.
- * @returns The middleware array and a teardown hook.
+ * @returns The middleware array, a teardown hook, and `bind` for the client.
  * @throws When `scope` names a model the contract does not define.
  * @example
  * ```typescript
@@ -100,11 +123,13 @@ export interface DataLayer {
  *     getActorId: currentActorId,
  * });
  *
- * export const db = postgres<Contract>({
- *     contractJson,
- *     url: config.db.url,
- *     middleware: layer.middleware,
- * });
+ * export const db = layer.bind(
+ *     postgres<Contract>({
+ *         contractJson,
+ *         url: config.db.url,
+ *         middleware: layer.middleware,
+ *     }),
+ * );
  * ```
  */
 export function dataLayer(options: DataLayerOptions): DataLayer {
@@ -115,6 +140,9 @@ export function dataLayer(options: DataLayerOptions): DataLayer {
               ...(options.audit.pool ? { pool: options.audit.pool } : {}),
               ...(options.audit.config ? { config: options.audit.config } : {}),
               getPrincipal: options.audit.getPrincipal,
+              ...(options.audit.onError
+                  ? { onError: options.audit.onError }
+                  : {}),
               stamps: derived.stamps,
               tables: derived.audit,
           })
@@ -138,5 +166,7 @@ export function dataLayer(options: DataLayerOptions): DataLayer {
             }),
         ],
         close: (): Promise<void> => recorded?.close() ?? Promise.resolve(),
+        bind: <Client extends object>(client: Client): Client =>
+            recorded ? recorded.bind(client) : client,
     };
 }

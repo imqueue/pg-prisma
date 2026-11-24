@@ -84,16 +84,50 @@ const layer = dataLayer({
     },
 });
 
-export const db = postgres<Contract>({
-    contractJson,
-    url: process.env.DATABASE_URL!,
-    middleware: layer.middleware,
-});
+export const db = layer.bind(
+    postgres<Contract>({
+        contractJson,
+        url: process.env.DATABASE_URL!,
+        middleware: layer.middleware,
+    }),
+);
 ```
 
 `dataLayer` returns the middlewares already composed. That is the point: a
 caller never orders them, and so cannot order them wrongly. Call
 `layer.close()` on shutdown to release the audit pool.
+
+`layer.bind(db)` is what keeps a rolled-back write out of the trail. The trail
+is written through its own pool, and the middleware is told that a statement
+ran in a transaction but not whether that transaction went on to commit. On a
+bound client, `db.transaction` — and `transactionFor`, and a repository's own
+nested create — holds the trail rows of the writes made inside it, writes them
+once COMMIT succeeds, and drops them when it rolls back. A crash between the
+commit and that insert loses them: the trail errs towards missing a write
+rather than recording one that never happened. Unbound, a write inside a
+transaction is recorded as soon as its statement completes, rollback or not,
+and the trail says so once. Without a trail, `bind` returns the client unchanged.
+
+Two cases `bind` cannot cover:
+
+- **The ORM's own transaction.** A top-level `db.orm` `update()`, `delete()`
+  or nested write runs inside a transaction the ORM opens for itself, out of
+  `bind`'s sight. Its trail row is written when the statement completes, so
+  if that transaction's COMMIT then fails, the row stays. For an audited
+  table, prefer the repository writes from `repositoriesFor`: each is a
+  single statement with no transaction around it, and so no such window.
+- **The outer client inside a transaction.** Inside a bound
+  `db.transaction(async tx => …)`, write only through `tx`. A write through
+  the outer `db` runs on another connection and commits on its own, but its
+  trail row is held with the transaction's — and dropped with them if the
+  transaction rolls back, leaving a committed write unrecorded.
+
+A trail that cannot be written — its table missing, the connection refused —
+never fails the write it records. It is reported instead, with the driver's
+error as `cause`: through `audit.onError` when one is given, and otherwise to
+`console.error`, and to the runtime's `log.warn` as well when the runtime has
+one. `postgres()` gives its runtime no log, so `console.error` is the report
+that is seen; an `onError` replaces both, so a failure is reported once.
 
 The trail records a write from the rows the database returns. So
 `repositoriesFor(db, { relations: layer.derived.relations })` makes every write
@@ -204,7 +238,9 @@ export class User {
 `stamp`, `accessScope` and `audit` are exported individually for cases
 `dataLayer` does not cover, and `deriveDataLayer` produces the config they take.
 The middlewares commute — `stamp` merges what were two order-dependent Prisma 7
-extensions — so there is no required order between them.
+extensions — so there is no required order between them. The middleware
+`audit` returns carries the same `bind` and takes the same `onError`, for a
+client composed by hand.
 
 ## Running Unit Tests
 

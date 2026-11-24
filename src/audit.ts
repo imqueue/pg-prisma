@@ -22,6 +22,7 @@
  * <support@imqueue.com> to get commercial licensing options.
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import pg from 'pg';
 import type { SqlMiddleware } from '@prisma/orm-postgres/family-runtime';
 import type { AnyQueryAst } from '@prisma/orm-postgres/relational-core/ast';
@@ -110,6 +111,29 @@ export interface AuditOptions {
     stamps?: StampTables;
     /** Resolves the actor to record, or a falsy value to record none. */
     getPrincipal: () => unknown;
+    /**
+     * Told whenever the trail could not record a write as it should, in
+     * place of the default report.
+     *
+     * @remarks
+     * A trail that cannot be written must not fail the write it records, so
+     * a failure is reported instead of thrown: the insert was refused
+     * (`error.cause` is the driver's error), or a write ran in a transaction
+     * while no client has been passed through `bind()`, which is said once.
+     *
+     * Omitted, the message goes to `console.error`, and to the runtime's
+     * `ctx.log.warn` as well when there is one. `console.error` is what makes
+     * it visible: `postgres()` does not forward a `log` to the runtime it
+     * builds, so there `ctx.log` is a no-op, and only a runtime constructed by
+     * hand has a log to hear it. Given, this replaces both, so a failure is
+     * reported once, where the application decided.
+     */
+    onError?: (error: Error) => void;
+}
+
+/** The part of the runtime's log the trail reports to. */
+interface RuntimeLog {
+    warn?(event: unknown): void;
 }
 
 interface Entry {
@@ -121,6 +145,8 @@ interface Entry {
 interface Batch {
     principal: string | null;
     entries: Entry[];
+    /** The runtime log of the statement, kept for a write made later. */
+    log?: RuntimeLog | undefined;
 }
 
 interface Plan {
@@ -147,11 +173,48 @@ interface Plan {
  * The actor is resolved at the **first row**, inside the statement's own async
  * context, for the same reason.
  *
+ * **A write in a transaction is recorded once the transaction commits.** The
+ * trail is written through its own pool, so a row inserted when the statement
+ * completes stays in the trail when the transaction rolls back afterwards —
+ * a write that never happened, attributed to a real actor. The middleware is
+ * told only that a statement ran in *a* transaction, not which one or how it
+ * ended, so the client is passed through `bind()`: its `transaction` then
+ * holds the trail rows of the writes made inside it, writes them once COMMIT
+ * has succeeded, and drops them when it rolls back. A crash between the
+ * commit and that insert loses them; the trail errs towards missing a write
+ * rather than recording one that did not happen.
+ *
+ * Two kinds of transaction are not seen by `bind()` and are recorded when the
+ * statement completes, as before: one opened on a client that was not bound
+ * — said once through `onError` while no client is bound — and the one the
+ * ORM opens for itself around a top-level `db.orm` `update()`, `delete()` or
+ * nested write, which leaves a trail row behind if its COMMIT fails. For an
+ * audited table, write through `repositoriesFor` instead: its writes are
+ * single statements, with no transaction around them and so no such window.
+ *
+ * Inside a bound transaction, write only through `tx`. A write through the
+ * outer client runs on another connection and commits on its own, but its
+ * rows are held with the transaction's — and dropped with them when the
+ * transaction rolls back, leaving a committed write unrecorded.
+ *
  * Call `close()` on the returned middleware when shutting down, or the pool
  * keeps the process alive.
  *
  * @param input - The trail's connection, table config, tables and actor.
- * @returns Middleware with a `close()` for teardown.
+ * @returns Middleware with a `close()` for teardown and a `bind()` for the
+ * client it is installed on.
+ * @example
+ * ```typescript
+ * const trail = audit({ connectionString, tables, getPrincipal });
+ * const db = trail.bind(
+ *     postgres<Contract>({ contractJson, url, middleware: [trail] }),
+ * );
+ *
+ * await db.transaction(async tx => {
+ *     await tx.orm.public.Invoice.where({ id }).update({ amount });
+ *     await charge(); // throws: the update rolls back and is not recorded
+ * });
+ * ```
  */
 export function audit({
     connectionString,
@@ -160,13 +223,133 @@ export function audit({
     tables,
     stamps = {},
     getPrincipal,
-}: AuditOptions): SqlMiddleware & { close(): Promise<void> } {
+    onError,
+}: AuditOptions): SqlMiddleware & {
+    /** Ends the trail's pool. */
+    close(): Promise<void>;
+    /**
+     * The client, with the writes of its transactions recorded on commit.
+     *
+     * @remarks
+     * Everything but `transaction` is the client's own. A client with no
+     * `transaction` of its own — one already inside a transaction — is
+     * returned as it is.
+     */
+    bind<Client extends object>(client: Client): Client;
+} {
     const pool = survivesLostConnections(
         new pg.Pool({ ...settings, connectionString }),
     );
     const table = config.table ?? DEFAULTS.table;
     const col = { ...DEFAULTS.columns, ...config.columns };
     const pending = new WeakMap<object, Batch>();
+    // The trail rows held by the bound transaction a statement runs in.
+    const open = new AsyncLocalStorage<Batch[]>();
+    let bound = false;
+    let unboundReported = false;
+
+    // Neither a reporter nor a log that throws may fail the write either.
+    const report = (error: Error, log?: RuntimeLog): void => {
+        if (onError) {
+            try {
+                onError(error);
+            } catch (thrown) {
+                console.error(error.message, thrown);
+            }
+
+            return;
+        }
+        console.error(error.message);
+        try {
+            log?.warn?.({ message: error.message, error });
+        } catch {
+            // Already said on stderr, which is the report that counts.
+        }
+    };
+
+    const modelsOf = (batch: Batch): string =>
+        [...new Set(batch.entries.map(entry => entry.model))].join(', ');
+
+    const write = async (batch: Batch): Promise<void> => {
+        const values = batch.entries
+            .map(
+                (_entry, i) =>
+                    `(gen_random_uuid(), $${i * 4 + 1}, $${i * 4 + 2}, ` +
+                    `$${i * 4 + 3}, $${batch.entries.length * 4 + 1}::jsonb, ` +
+                    `$${i * 4 + 4}::jsonb, now())`,
+            )
+            .join(', ');
+        const params = batch.entries.flatMap(entry => [
+            entry.action,
+            entry.model,
+            String(entry.row.id),
+            JSON.stringify(entry.row),
+        ]);
+
+        await pool
+            .query(
+                `INSERT INTO "${table}" ("id", "${col.action}", ` +
+                    `"${col.modelName}", "${col.recordId}", "${col.principal}", ` +
+                    `"${col.changes}", "${col.createdAt}") VALUES ${values}`,
+                [...params, batch.principal],
+            )
+            .then(
+                () => undefined,
+                // An audit that cannot be written must not fail the write
+                // it was recording — but a trail that silently stops is
+                // worse than one that is noisy about stopping.
+                (error: unknown) => {
+                    const reason =
+                        error instanceof Error ? error.message : String(error);
+
+                    report(
+                        new Error(
+                            `audit trail: ${batch.entries.length} write(s) ` +
+                                `to ${modelsOf(batch)} not recorded in ` +
+                                `"${table}": ${reason}`,
+                            { cause: error },
+                        ),
+                        batch.log,
+                    );
+                },
+            );
+    };
+
+    const bind = <Client extends object>(client: Client): Client => {
+        const transaction: unknown = Reflect.get(client, 'transaction');
+
+        if (typeof transaction !== 'function') {
+            return client;
+        }
+
+        // Rows are held for the transaction they were written in, and
+        // written only once it has committed. A rejection — the callback
+        // threw, or COMMIT itself failed — means the database kept none of
+        // them, so neither does the trail.
+        const transactionally = async (
+            ...args: unknown[]
+        ): Promise<unknown> => {
+            const held: Batch[] = [];
+            const result: unknown = await open.run(held, () =>
+                Reflect.apply(transaction, client, args),
+            );
+
+            for (const batch of held) {
+                await write(batch);
+            }
+
+            return result;
+        };
+
+        bound = true;
+
+        return new Proxy(client, {
+            get: (target, key, receiver) =>
+                key === 'transaction'
+                    ? transactionally
+                    : Reflect.get(target, key, receiver),
+        });
+    };
 
     const tableOf = (ast?: AnyQueryAst): string | undefined =>
         ast?.kind === 'insert' ||
@@ -206,6 +389,7 @@ export function audit({
         familyId: 'sql' as const,
         /** Ends the trail's pool. */
         close: (): Promise<void> => pool.end(),
+        bind,
         async onRow(row: Record<string, unknown>, plan: Plan): Promise<void> {
             const ast = plan?.ast;
             const table = tableOf(ast);
@@ -237,10 +421,13 @@ export function audit({
         async afterQuery(
             plan: Plan,
             result: { readonly completed?: boolean },
-            ctx: { readonly log?: { warn?: (m: string, f?: unknown) => void } },
+            ctx: { readonly scope?: string; readonly log?: RuntimeLog },
         ): Promise<void> {
             const batch = pending.get(plan);
             pending.delete(plan);
+            if (batch) {
+                batch.log = ctx?.log;
+            }
             // A statement that threw still reaches here, with `completed`
             // false. Recording those would put writes in the trail that the
             // database rolled back.
@@ -251,38 +438,33 @@ export function audit({
             ) {
                 return;
             }
-            const values = batch.entries
-                .map(
-                    (_entry, i) =>
-                        `(gen_random_uuid(), $${i * 4 + 1}, $${i * 4 + 2}, ` +
-                        `$${i * 4 + 3}, $${batch.entries.length * 4 + 1}::jsonb, ` +
-                        `$${i * 4 + 4}::jsonb, now())`,
-                )
-                .join(', ');
-            const params = batch.entries.flatMap(entry => [
-                entry.action,
-                entry.model,
-                String(entry.row.id),
-                JSON.stringify(entry.row),
-            ]);
-            await pool
-                .query(
-                    `INSERT INTO "${table}" ("id", "${col.action}", ` +
-                        `"${col.modelName}", "${col.recordId}", "${col.principal}", ` +
-                        `"${col.changes}", "${col.createdAt}") VALUES ${values}`,
-                    [...params, batch.principal],
-                )
-                .then(
-                    () => undefined,
-                    // An audit that cannot be written must not fail the write
-                    // it was recording — but a trail that silently stops is
-                    // worse than one that is noisy about stopping.
-                    (error: unknown) => {
-                        ctx?.log?.warn?.('audit trail insert failed', {
-                            error,
-                        });
-                    },
-                );
+            // So would recording a statement that completed in a transaction
+            // rolled back after it, which is why one there waits for COMMIT.
+            if (ctx?.scope === 'transaction') {
+                const held = open.getStore();
+
+                if (held) {
+                    held.push(batch);
+
+                    return;
+                }
+                // Which transaction this is cannot be told from here, so the
+                // report is about the configuration, not about this write.
+                if (!bound && !unboundReported) {
+                    unboundReported = true;
+                    report(
+                        new Error(
+                            `audit trail: a write to ${modelsOf(batch)} ran ` +
+                                'in a transaction, and no client has been ' +
+                                'passed through bind(): a write inside ' +
+                                'db.transaction() is recorded before it ' +
+                                'commits, and stays recorded if it rolls back',
+                        ),
+                        batch.log,
+                    );
+                }
+            }
+            await write(batch);
         },
     };
 }

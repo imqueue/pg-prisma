@@ -72,13 +72,14 @@ service's integration suite, not here.
 | `src/data-layer.ts` | `dataLayer()` — the composed middleware array, in one call. |
 | `src/stamp.ts` | Soft-delete and authorship, as one middleware. |
 | `src/access-scope.ts` | Row-level access-scope middleware. |
-| `src/audit.ts` | Audit-trail middleware, writing through its own pool. |
+| `src/audit.ts` | Audit-trail middleware, writing through its own pool; `bind()` holds a transaction's rows until COMMIT. |
 | `src/audited.ts` | Internal: the tables a derivation records, keyed by its relation map. |
 | `src/archive.ts` | Row-archiving installer (aged rows → mirror `archive` schema, pg_cron). |
 | `src/change-notify.ts` | Postgres row-change `NOTIFY` trigger installer. |
 | `src/pretty-sql.ts` | `prettifySql()` SQL pretty-printer for query logging. |
 | `src/sql-log.ts` | Cooperative SQL-log suppression (`silently`, `isSqlLogSuppressed`). |
 | `test/**` | `node:test` specs (`*.spec.ts`). |
+| `test/unit/support/recorded-client.ts` | The real client and layer over a recording pool, with a trail that keeps what it inserts. |
 
 ## Behavioural invariants
 
@@ -107,6 +108,30 @@ service's integration suite, not here.
   row. A shared buffer lets one statement flush another's rows under the wrong
   actor — the worst failure a security trail has. Key by the plan object, and
   resolve the actor at the first row, inside that statement's async context.
+- **A write in a transaction reaches the trail only after COMMIT.** The trail
+  has its own pool, so a row inserted when the statement completes outlives a
+  rollback. Middleware sees `ctx.scope === 'transaction'` and nothing else —
+  no transaction identity, connection, or commit hook (Prisma Next rc.12) — so
+  `audit().bind(db)` / `layer.bind(db)` wraps `db.transaction`, holds the
+  batches in `AsyncLocalStorage`, and writes them once the wrapped call
+  resolves. A transaction scope with no held store (an unbound client, or the
+  ORM's own transaction around a top-level `update()`/`delete()`) is written
+  at once, as before. `test/unit/audit-transaction.spec.ts` covers it.
+- **Two gaps `bind()` leaves, documented rather than closed.** (i) The ORM's
+  hidden transaction around a top-level `db.orm` `update()`/`delete()`/nested
+  write: its row is written before that COMMIT, so a failed COMMIT leaves it.
+  Repository writes are single statements with no such window — recommend
+  them for audited tables. (ii) Inside a bound transaction, a write through
+  the outer `db` rather than `tx` commits on its own but is held with the
+  transaction's rows, and is dropped with them on rollback. The README says
+  both; keep it saying them until either is closed.
+- **A trail failure is reported, never thrown.** Default: `console.error`,
+  plus `ctx.log.warn` when the runtime has a log. `postgres()` forwards only
+  `verifyMarker` and `middleware` to the runtime, so `ctx.log` is a no-op
+  there and `console.error` is what is seen; only a hand-built runtime has a
+  log. A user `onError` replaces both — one report, not two. Neither a
+  throwing reporter nor a throwing log may fail the write. A held batch keeps
+  its statement's `ctx.log`, since it is written after COMMIT, outside it.
 - **An update by id is one statement.** `Repository.update` sends a single
   `UPDATE … RETURNING` rather than the ORM's `update` (a transaction around a
   read and a write), so the middleware must narrow an `UPDATE` exactly as it
